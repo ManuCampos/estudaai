@@ -1,0 +1,23 @@
+return <AlunoDashboard user={user} refresh={refresh} setPage={setPage}/>;
+      if (page==="plano")     return <AlunoPlano     user={user} refresh={refresh}/>;
+      if (page==="rotina")    return <AlunoRotina    user={user} refresh={refresh}/>;
+      if (page==="progresso") return <AlunoProgresso user={user}/>;
+      if (page==="conteudos") return <AlunoConteudos user={user}/>;
+      if (page==="simulados") return <AlunoSimulados user={user} refresh={refresh}/>;
+      if (page==="ranking")   return <AlunoRanking   user={user}/>;
+    }
+  };
+
+  return (
+    <Layout
+      user={user}
+      page={page}
+      setPage={setPage}
+      onLogout={() => { logModule.add(user.id, "Logout", {}); setUser(null); }}
+    >
+      {renderPage()}
+    </Layout>
+  );
+}
+
+export default App;
