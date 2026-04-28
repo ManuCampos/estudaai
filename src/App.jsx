@@ -3841,10 +3841,23 @@ function AlunoResumos({ user, refresh }) {
   const [editForm, setEditForm] = useState({ titulo: "", conteudo: "" });
   const [showExportModal, setShowExportModal] = useState(false);
   const [exportResumoId, setExportResumoId] = useState(null);
+  const [showNovoResumo, setShowNovoResumo] = useState(false);
+  const [novoForm, setNovoForm] = useState({ materia: "", titulo: "", conteudo: "" });
 
   const plano = planosModule.getByAluno(user.id)[0] || null;
   const edital = plano ? editaisModule.getById(plano.editalId) : null;
   const resumos = resumoModule.getByAluno(user.id);
+
+  const handleCriarResumo = () => {
+    if (novoForm.materia && novoForm.titulo && novoForm.conteudo) {
+      resumoModule.save(null, user.id, `topic-${Date.now()}`, novoForm.titulo, novoForm.conteudo, novoForm.materia);
+      setNovoForm({ materia: "", titulo: "", conteudo: "" });
+      setShowNovoResumo(false);
+      refresh();
+    } else {
+      alert("Preencha todos os campos!");
+    }
+  };
 
   if (!plano || !edital) {
     return (
@@ -3953,6 +3966,86 @@ function AlunoResumos({ user, refresh }) {
 
   return (
     <div>
+      {showNovoResumo && (
+        <div className="overlay" onClick={() => setShowNovoResumo(false)}>
+          <div className="modal fi" style={{ maxWidth: 500, padding: "30px" }} onClick={e => e.stopPropagation()}>
+            <div className="modal-hd" style={{ marginBottom: "20px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <h2 style={{ margin: 0, fontSize: 18, fontWeight: 700 }}>➕ Novo Resumo</h2>
+              <button className="modal-x" onClick={() => setShowNovoResumo(false)}>✕</button>
+            </div>
+            <div style={{ display: "grid", gap: 15 }}>
+              <div>
+                <label style={{ fontSize: 13, fontWeight: 600, color: "var(--t2)", marginBottom: 6, display: "block" }}>Matéria</label>
+                <select
+                  value={novoForm.materia}
+                  onChange={(e) => setNovoForm({ ...novoForm, materia: e.target.value })}
+                  style={{
+                    width: "100%",
+                    padding: "10px 12px",
+                    borderRadius: 6,
+                    border: "1px solid var(--b2)",
+                    fontFamily: "inherit",
+                    fontSize: "inherit",
+                    background: "var(--s1)"
+                  }}
+                >
+                  <option value="">Selecione uma matéria...</option>
+                  {edital?.materias?.map(m => (
+                    <option key={m.id} value={m.id}>{m.name}</option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label style={{ fontSize: 13, fontWeight: 600, color: "var(--t2)", marginBottom: 6, display: "block" }}>Título</label>
+                <input
+                  type="text"
+                  value={novoForm.titulo}
+                  onChange={(e) => setNovoForm({ ...novoForm, titulo: e.target.value })}
+                  placeholder="Ex: Princípios Fundamentais da Constituição"
+                  style={{
+                    width: "100%",
+                    padding: "10px 12px",
+                    borderRadius: 6,
+                    border: "1px solid var(--b2)",
+                    fontFamily: "inherit",
+                    fontSize: "inherit"
+                  }}
+                />
+              </div>
+
+              <div>
+                <label style={{ fontSize: 13, fontWeight: 600, color: "var(--t2)", marginBottom: 6, display: "block" }}>Conteúdo</label>
+                <textarea
+                  value={novoForm.conteudo}
+                  onChange={(e) => setNovoForm({ ...novoForm, conteudo: e.target.value })}
+                  placeholder="Escreva seu resumo aqui..."
+                  style={{
+                    width: "100%",
+                    minHeight: 250,
+                    padding: "12px",
+                    borderRadius: 6,
+                    border: "1px solid var(--b2)",
+                    fontFamily: "monospace",
+                    fontSize: 13,
+                    resize: "vertical"
+                  }}
+                />
+              </div>
+
+              <div style={{ display: "flex", gap: 10 }}>
+                <button className="btn btn-green" onClick={handleCriarResumo} style={{ flex: 1 }}>
+                  ✓ Criar Resumo
+                </button>
+                <button className="btn btn-ghost" onClick={() => setShowNovoResumo(false)} style={{ flex: 1 }}>
+                  ✕ Cancelar
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {showExportModal && (
         <div className="overlay" onClick={() => setShowExportModal(false)}>
           <div className="modal fi" style={{ maxWidth: 400, padding: "30px" }} onClick={e => e.stopPropagation()}>
@@ -3993,10 +4086,10 @@ function AlunoResumos({ user, refresh }) {
         </div>
       )}
 
-      <div className="ph"><div><h1>📓 Resumos</h1><p>{edital.name}</p></div></div>
+      <div className="ph"><div><div><h1>📓 Resumos</h1><p>{edital.name}</p></div><button className="btn btn-green" onClick={() => setShowNovoResumo(true)}>➕ Novo Resumo</button></div></div>
 
       {resumos.length === 0 ? (
-        <div className="card"><div className="empty"><h3>Nenhum resumo ainda</h3><p>Comece a criar resumos dos seus estudos.</p></div></div>
+        <div className="card"><div className="empty"><h3>Nenhum resumo ainda</h3><p>Comece a criar resumos dos seus estudos.<br/><button className="btn btn-green mt2" onClick={() => setShowNovoResumo(true)}>➕ Criar Primeiro Resumo</button></p></div></div>
       ) : (
         <>
           <div className="g3 mb4">
