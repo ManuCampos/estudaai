@@ -172,6 +172,8 @@ const defaultDB = {
   simulados: [],
   questoes: [],
   tentativas: [],
+  batalhas: [],
+  feedbackSimulado: [],
   resumoComments: [],
   resumoAdditions: [],
   materialFiles: [],
@@ -315,6 +317,24 @@ const REVIEW_PRESETS = {
 const REVIEW_PRESET_LABELS = { baixa: "Baixa", moderada: "Moderada", intensa: "Intensa" };
 const REVIEW_PRESET_DESCS  = { baixa: "3 revisões: 1, 14, 21d", moderada: "4 revisões: 1, 7, 21, 30d", intensa: "5 revisões: 1, 7, 14, 21, 30d" };
 
+// Feriados nacionais fixos brasileiros (MM-DD)
+const FERIADOS_FIXOS_BR = ["01-01","04-21","05-01","09-07","10-12","11-02","11-15","11-20","12-25"];
+function isFeriadoBR(date) {
+  const mm = String(date.getMonth()+1).padStart(2,"0");
+  const dd = String(date.getDate()).padStart(2,"0");
+  return FERIADOS_FIXOS_BR.includes(`${mm}-${dd}`);
+}
+// Avança para o próximo dia válido (estudo permitido e não feriado)
+function proximoDiaUtil(date, aulasNoDiaFn, maxDias=30) {
+  let d = new Date(date);
+  let safety = 0;
+  while ((aulasNoDiaFn(d.getDay()) === 0 || isFeriadoBR(d)) && safety < maxDias) {
+    d.setDate(d.getDate() + 1);
+    safety++;
+  }
+  return d;
+}
+
 const planosModule = {
   generate(alunoId, editalId, rotina) {
     const edital = editaisModule.getById(editalId);
@@ -329,7 +349,12 @@ const planosModule = {
     const nivelCobertura = rotina.nivelCobertura || ["media"];
     const filtrarPorNivel = (topicos) => {
       return topicos.filter(t => {
-        // If any of the selected levels has content, include this topic
+        // If topic has no content fields set at all, always include it
+        const temQualquerConteudo = (t.conteudoBaixa?.trim().length > 0) ||
+                                    (t.conteudoMedia?.trim().length > 0) ||
+                                    (t.conteudoAlta?.trim().length > 0);
+        if (!temQualquerConteudo) return true;
+        // Otherwise, include only if the selected nivel has content
         return nivelCobertura.some(nivel => {
           switch(nivel) {
             case "baixa": return t.conteudoBaixa?.trim().length > 0;
@@ -340,18 +365,24 @@ const planosModule = {
         });
       });
     };
-    // Build per-materia topic queues and interleave round-robin
+    // Build per-materia topic queues and distribute according to mode
+    const modoOrganizacao = rotina.modoOrganizacao || "alternado";
     const queues = materias.map(m =>
       filtrarPorNivel(m.topicos).map(t => ({ ...t, materiaId: m.id, materiaName: m.name, materiaColor: m.color, materiaReviewPreset: m.reviewPreset || "moderada" }))
     );
     const allTopicos = [];
-    let remaining = queues.filter(q => q.length > 0);
-    let cursors = queues.map(() => 0);
-    while (remaining.some((_, i) => cursors[i] < queues[i].length)) {
-      for (let i = 0; i < queues.length; i++) {
-        if (cursors[i] < queues[i].length) {
-          allTopicos.push(queues[i][cursors[i]]);
-          cursors[i]++;
+    if (modoOrganizacao === "sequencial") {
+      // Sequential: all topics of each materia before moving to the next
+      queues.forEach(q => allTopicos.push(...q));
+    } else {
+      // Alternated: round-robin interleaving
+      let cursors = queues.map(() => 0);
+      while (queues.some((q, i) => cursors[i] < q.length)) {
+        for (let i = 0; i < queues.length; i++) {
+          if (cursors[i] < queues[i].length) {
+            allTopicos.push(queues[i][cursors[i]]);
+            cursors[i]++;
+          }
         }
       }
     }
@@ -379,13 +410,9 @@ const planosModule = {
           plan[key].topicos.push({ ...allTopicos[topicIdx] });
           const reviewIntervals = REVIEW_PRESETS[allTopicos[topicIdx].materiaReviewPreset || "moderada"] || REVIEW_INTERVALS;
           reviewIntervals.forEach(interval => {
-            // Move review to next study day if it falls on a day off
+            // Move review to next dia útil (sem feriado, sem dia sem aula)
             let revDate = new Date(d); revDate.setDate(revDate.getDate() + interval);
-            let safety = 0;
-            while (aulasNoDia(revDate.getDay()) === 0 && safety < 7) {
-              revDate.setDate(revDate.getDate() + 1);
-              safety++;
-            }
+            revDate = proximoDiaUtil(revDate, aulasNoDia);
             const revKey = localDateKey(revDate);
             if (!reviews[revKey]) reviews[revKey] = [];
             reviews[revKey].push({ ...allTopicos[topicIdx], reviewInterval: interval });
@@ -401,6 +428,7 @@ const planosModule = {
     });
     // Cap reviews per day — redistribute overflow to next study day
     const maxRevDay = rotina.maxRevisoesPorDia || 0;
+    const minRevDay = rotina.minRevisoesPorDia || 0;
     if (maxRevDay > 0) {
       const sortedKeys = Object.keys(plan).sort();
       for (let i = 0; i < sortedKeys.length; i++) {
@@ -503,12 +531,25 @@ const progressoModule = {
   getStats(alunoId, planoId) {
     const plano = planosModule.getById(planoId);
     if (!plano) return null;
-    const totalAulas = Object.values(plano.plan).reduce((a, d) => a + d.topicos.length, 0);
-    const totalReviews = Object.values(plano.plan).reduce((a, d) => a + d.reviews.length, 0);
     const prog = storage.get().progresso.filter(p => p.alunoId === alunoId && p.planoId === planoId && p.done);
-    const aulasFeitas = prog.filter(p => !p.key.endsWith("-rev")).length;
+
+    // IDs únicos de tópicos (aulas) já concluídos — chave: "YYYY-MM-DD-{topicId}"
+    const doneTopicIdSet = new Set(
+      prog.filter(p => !p.key.endsWith("-rev")).map(p => p.key.substring(11))
+    );
+    const aulasFeitas = doneTopicIdSet.size;
+
+    // Tópicos no plano atual que ainda NÃO foram feitos.
+    // Após regenerarFuturo o plano só tem os restantes; após generate() tem todos.
+    // Em ambos os casos: total = feitas + ainda-no-plano-não-feitas.
+    const notDoneInPlan = Object.values(plano.plan)
+      .flatMap(d => d.topicos)
+      .filter(t => !doneTopicIdSet.has(t.id)).length;
+    const totalAulas = aulasFeitas + notDoneInPlan;
+
+    const totalReviews = Object.values(plano.plan).reduce((a, d) => a + d.reviews.length, 0);
     const reviewsFeitas = prog.filter(p => p.key.endsWith("-rev")).length;
-    const pct = totalAulas ? Math.round((aulasFeitas / totalAulas) * 100) : 0;
+    const pct = totalAulas ? Math.min(100, Math.round((aulasFeitas / totalAulas) * 100)) : 0;
     const aulasPorDia = plano.rotina?.aulasPorDia || 1;
     const diasRestantes = aulasFeitas < totalAulas ? Math.ceil((totalAulas - aulasFeitas) / aulasPorDia) : 0;
     const previsao = diasRestantes > 0
@@ -636,10 +677,11 @@ const gamificacaoModule = {
 // MODULE: simulados (Exam/Quizzes)
 // ============================================================
 const simuladosModule = {
-  create(coachId, editalId, nome, tipo, materiaId, descricao) {
+  create(coachId, editalId, nome, tipo, materiaId, descricao, alunosPermitidos) {
     const id = "sim_" + Math.random().toString(36).substr(2,9);
     const simulado = {
       id, coachId, editalId, nome, tipo, materiaId: tipo === "geral" ? null : materiaId, descricao,
+      alunosPermitidos: alunosPermitidos || null,
       createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
     };
     storage.set(db => ({ ...db, simulados: [...(db.simulados || []), simulado] }));
@@ -653,6 +695,12 @@ const simuladosModule = {
   },
   getByEdital(editalId) {
     return (storage.get().simulados || []).filter(s => s.editalId === editalId);
+  },
+  getByEditalParaAluno(editalId, alunoId) {
+    return (storage.get().simulados || []).filter(s =>
+      s.editalId === editalId &&
+      (s.alunosPermitidos === null || s.alunosPermitidos === undefined || s.alunosPermitidos.includes(alunoId))
+    );
   },
   update(id, updates) {
     storage.set(db => ({
@@ -758,20 +806,27 @@ const tentativasModule = {
       const tentativa = tentativas.find(t => t.id === tentativaId);
       if (!tentativa) return db;
       const questoes = questoesModule.getBySimulado(tentativa.simuladoId);
-      let acertos = 0, erros = 0;
+      let acertos = 0, erros = 0, brancos = 0;
       const respostasIncorretas = [];
+      const isTodoCE = questoes.every(q => q.tipo === "ce");
       questoes.forEach(q => {
         const resp = tentativa.respostas.find(r => r.questaoId === q.id);
-        if (resp && resp.resposta === q.gabarito) acertos++;
-        else {
+        if (!resp || !resp.resposta) {
+          brancos++;
+        } else if (resp.resposta === q.gabarito) {
+          acertos++;
+        } else {
           erros++;
           respostasIncorretas.push({ questaoId: q.id, questaoEnunciado: q.enunciado });
         }
       });
+      const pontosCebraspe = isTodoCE ? (acertos - erros) : null;
+      const total = questoes.length;
+      const percentual = total > 0 ? Math.round((acertos / total) * 100) : 0;
       return {
         ...db,
         tentativas: tentativas.map(t => t.id === tentativaId
-          ? { ...t, finishedAt: new Date().toISOString(), status: "finalizada", acertos, erros, tempoDecorridoSegundos, respostasIncorretas }
+          ? { ...t, finishedAt: new Date().toISOString(), status: "finalizada", acertos, erros, brancos, pontosCebraspe, percentual, tempoDecorridoSegundos, respostasIncorretas }
           : t
         )
       };
@@ -783,6 +838,130 @@ const tentativasModule = {
     const tentativas = (storage.get().tentativas || []).filter(t => t.simuladoId === simuladoId && t.status === "finalizada");
     return { simulado, tentativas };
   }
+};
+
+// ============================================================
+// MODULE: batalhas (Batalhas entre alunos)
+// ============================================================
+const batalhasModule = {
+  create(coachId, simuladoId, nome, dataFim, tempoLimite, alunoIds) {
+    const batalha = {
+      id: "bat_" + Math.random().toString(36).substr(2,9),
+      nome: nome || "Batalha",
+      coachId,
+      simuladoId,
+      dataFim,
+      tempoLimite: tempoLimite || null,
+      status: "ativa",
+      criadaEm: new Date().toISOString(),
+      participantes: alunoIds.map(alunoId => ({
+        alunoId,
+        tentativaId: null,
+        finalizado: false,
+        acertos: 0,
+        erros: 0,
+        brancos: 0,
+        pontosCebraspe: null,
+        percentual: 0,
+        tempoGasto: 0,
+      }))
+    };
+    storage.set(db => ({ ...db, batalhas: [...(db.batalhas || []), batalha] }));
+    return batalha;
+  },
+  getByCoach(coachId) {
+    return (storage.get().batalhas || []).filter(b => b.coachId === coachId);
+  },
+  getByAluno(alunoId) {
+    return (storage.get().batalhas || []).filter(b =>
+      b.participantes && b.participantes.some(p => p.alunoId === alunoId)
+    );
+  },
+  getById(id) {
+    return (storage.get().batalhas || []).find(b => b.id === id);
+  },
+  registrarResultado(batalhaId, alunoId, tentativaId, acertos, erros, brancos, pontosCebraspe, percentual, tempoGasto) {
+    storage.set(db => ({
+      ...db,
+      batalhas: (db.batalhas || []).map(b => {
+        if (b.id !== batalhaId) return b;
+        return {
+          ...b,
+          participantes: b.participantes.map(p => {
+            if (p.alunoId !== alunoId) return p;
+            return { ...p, tentativaId, finalizado: true, acertos, erros, brancos, pontosCebraspe, percentual, tempoGasto };
+          })
+        };
+      })
+    }));
+  },
+  encerrar(batalhaId) {
+    storage.set(db => ({
+      ...db,
+      batalhas: (db.batalhas || []).map(b => b.id === batalhaId ? { ...b, status: "encerrada" } : b)
+    }));
+  },
+  delete(batalhaId) {
+    storage.set(db => ({ ...db, batalhas: (db.batalhas || []).filter(b => b.id !== batalhaId) }));
+  },
+  getRanking(batalhaId) {
+    const b = (storage.get().batalhas || []).find(x => x.id === batalhaId);
+    if (!b) return [];
+    const finalizados = (b.participantes || []).filter(p => p.finalizado);
+    return finalizados.sort((a, z) => {
+      const pa = a.pontosCebraspe !== null ? a.pontosCebraspe : a.percentual;
+      const pz = z.pontosCebraspe !== null ? z.pontosCebraspe : z.percentual;
+      if (pz !== pa) return pz - pa;
+      if (z.acertos !== a.acertos) return z.acertos - a.acertos;
+      return a.tempoGasto - z.tempoGasto;
+    });
+  }
+};
+
+// ============================================================
+// MODULE: feedbackSimulado (Coach → Aluno)
+// ============================================================
+const feedbackModule = {
+  // Salva ou atualiza rascunho de feedback
+  salvar(coachId, tentativaId, dados) {
+    storage.set(db => {
+      const feedbacks = db.feedbackSimulado || [];
+      const tentativa = (db.tentativas || []).find(t => t.id === tentativaId);
+      if (!tentativa) return db;
+      const idx = feedbacks.findIndex(f => f.tentativaId === tentativaId);
+      const feedback = {
+        id: idx >= 0 ? feedbacks[idx].id : `fb_${Math.random().toString(36).substr(2,9)}`,
+        tentativaId,
+        simuladoId: tentativa.simuladoId,
+        alunoId: tentativa.alunoId,
+        coachId,
+        comentariosQuestoes: dados.comentariosQuestoes || [],
+        orientacoesGerais: dados.orientacoesGerais || "",
+        sugestoesConteudo: dados.sugestoesConteudo || "",
+        temasRevisar: dados.temasRevisar || "",
+        status: dados.status || "rascunho",
+        criadoEm: idx >= 0 ? feedbacks[idx].criadoEm : new Date().toISOString(),
+        atualizadoEm: new Date().toISOString(),
+        enviadoEm: dados.status === "enviado" ? new Date().toISOString() : (idx >= 0 ? feedbacks[idx].enviadoEm : null),
+      };
+      return {
+        ...db,
+        feedbackSimulado: idx >= 0
+          ? feedbacks.map((f, i) => i === idx ? feedback : f)
+          : [...feedbacks, feedback]
+      };
+    });
+  },
+  getByTentativa(tentativaId) {
+    return (storage.get().feedbackSimulado || []).find(f => f.tentativaId === tentativaId) || null;
+  },
+  getByAluno(alunoId) {
+    return (storage.get().feedbackSimulado || []).filter(f => f.alunoId === alunoId && f.status === "enviado");
+  },
+  getEnviadoParaAluno(tentativaId) {
+    const fb = (storage.get().feedbackSimulado || []).find(f => f.tentativaId === tentativaId);
+    return fb?.status === "enviado" ? fb : null;
+  },
 };
 
 // Adiantar aulas: move N topics from future days to today
@@ -845,14 +1024,19 @@ planosModule.regenerarFuturo = function(planoId, alunoId, novaRotina) {
   // Build list of all plan topics not yet done
   const materiaIds = rotina.materiaIds && rotina.materiaIds.length > 0 ? rotina.materiaIds : null;
   const materias = materiaIds ? edital.materias.filter(m => materiaIds.includes(m.id)) : edital.materias;
+  const modoOrganizacao = rotina.modoOrganizacao || "alternado";
   const queues = materias.map(m =>
     m.topicos.map(t => ({ ...t, materiaId: m.id, materiaName: m.name, materiaColor: m.color, materiaReviewPreset: m.reviewPreset || "moderada" }))
   );
   const allTopicos = [];
-  let cursors = queues.map(() => 0);
-  while (queues.some((q, i) => cursors[i] < q.length)) {
-    for (let i = 0; i < queues.length; i++) {
-      if (cursors[i] < queues[i].length) { allTopicos.push(queues[i][cursors[i]]); cursors[i]++; }
+  if (modoOrganizacao === "sequencial") {
+    queues.forEach(q => allTopicos.push(...q));
+  } else {
+    let cursors = queues.map(() => 0);
+    while (queues.some((q, i) => cursors[i] < q.length)) {
+      for (let i = 0; i < queues.length; i++) {
+        if (cursors[i] < queues[i].length) { allTopicos.push(queues[i][cursors[i]]); cursors[i]++; }
+      }
     }
   }
   // Filter to only not-done topics
@@ -882,8 +1066,7 @@ planosModule.regenerarFuturo = function(planoId, alunoId, novaRotina) {
         const intervals = REVIEW_PRESETS[remaining[topicIdx].materiaReviewPreset || "moderada"] || REVIEW_INTERVALS;
         intervals.forEach(interval => {
           let revDate = new Date(d); revDate.setDate(revDate.getDate() + interval);
-          let safety = 0;
-          while (aulasNoDia(revDate.getDay()) === 0 && safety < 7) { revDate.setDate(revDate.getDate() + 1); safety++; }
+          revDate = proximoDiaUtil(revDate, aulasNoDia);
           const revKey = localDateKey(revDate);
           if (!reviews[revKey]) reviews[revKey] = [];
           reviews[revKey].push({ ...remaining[topicIdx], reviewInterval: interval });
@@ -899,6 +1082,7 @@ planosModule.regenerarFuturo = function(planoId, alunoId, novaRotina) {
   });
   // Cap reviews per day
   const maxRevDay = rotina.maxRevisoesPorDia || 0;
+  const minRevDay = rotina.minRevisoesPorDia || 0;
   if (maxRevDay > 0) {
     const sortedKeys = Object.keys(plan).sort();
     for (let i = 0; i < sortedKeys.length; i++) {
@@ -912,10 +1096,77 @@ planosModule.regenerarFuturo = function(planoId, alunoId, novaRotina) {
       }
     }
   }
+  // Pull forward reviews to meet minimum per day
+  if (minRevDay > 0) {
+    const sortedKeys = Object.keys(plan).sort();
+    for (let i = 0; i < sortedKeys.length; i++) {
+      const dk = sortedKeys[i];
+      const cap = maxRevDay > 0 ? maxRevDay : 999;
+      let needed = minRevDay - plan[dk].reviews.length;
+      let j = i + 1;
+      while (needed > 0 && j < sortedKeys.length) {
+        const future = sortedKeys[j];
+        const available = plan[future].reviews;
+        const take = Math.min(needed, available.length, cap - plan[dk].reviews.length);
+        if (take > 0) {
+          plan[dk].reviews = [...plan[dk].reviews, ...available.splice(0, take)];
+          needed -= take;
+        }
+        j++;
+      }
+    }
+  }
+  // Reagenda revisões FUTURAS das aulas já concluídas (que sumiram ao regenerar o plano).
+  // Para cada aula feita, calcula os intervalos de revisão e adiciona ao plano
+  // apenas as datas que ainda não chegaram e ainda não foram feitas.
+  const topicMap = {};
+  allTopicos.forEach(t => { topicMap[t.id] = t; });
+  // Também inclui os tópicos que estavam no plano antigo mas não estão em allTopicos (edge case)
+  Object.values(plano.plan || {}).forEach(day =>
+    (day.topicos || []).forEach(t => { if (!topicMap[t.id]) topicMap[t.id] = t; })
+  );
+  const doneRevKeys = new Set(
+    (db.progresso || []).filter(p => p.planoId === planoId && p.done && p.key.endsWith('-rev')).map(p => p.key)
+  );
+  // Agrupa por topicId → data mais antiga de conclusão
+  const doneByTopic = {};
+  doneProgresso.forEach(p => {
+    const date = p.key.substring(0, 10);
+    const tid  = p.key.substring(11);
+    if (!doneByTopic[tid] || date < doneByTopic[tid]) doneByTopic[tid] = date;
+  });
+  Object.entries(doneByTopic).forEach(([topicId, completionDate]) => {
+    const topicObj = topicMap[topicId];
+    if (!topicObj) return;
+    const intervals = REVIEW_PRESETS[topicObj.materiaReviewPreset || "moderada"] || [1, 7, 21, 30];
+    const compD = new Date(completionDate + "T12:00:00");
+    intervals.forEach(interval => {
+      let revDate = new Date(compD);
+      revDate.setDate(revDate.getDate() + interval);
+      revDate = proximoDiaUtil(revDate, aulasNoDia);
+      const revKey = localDateKey(revDate);
+      if (revKey < todayKey) return; // já passou
+      // Verifica se a revisão já foi feita pelo aluno
+      const progressoRevKey = `${revKey}-${topicId}-rev`;
+      if (doneRevKeys.has(progressoRevKey)) return; // já concluída
+      if (!plan[revKey]) plan[revKey] = { date: revKey, topicos: [], reviews: [] };
+      // Evita duplicata
+      if (!plan[revKey].reviews.find(r => r.id === topicId && r.reviewInterval === interval)) {
+        plan[revKey].reviews.push({ ...topicObj, reviewInterval: interval });
+      }
+    });
+  });
+
+  // Preserva os dias passados para que o histórico de semanas anteriores continue visível
+  const pastPlan = {};
+  Object.entries(plano.plan || {}).forEach(([key, day]) => {
+    if (key < todayKey) pastPlan[key] = day;
+  });
+  const fullPlan = { ...pastPlan, ...plan };
   // Update existing plan in-place (keep planoId and progress)
   storage.set(db => ({
     ...db,
-    planos: db.planos.map(p => p.id === planoId ? { ...p, rotina, plan } : p),
+    planos: db.planos.map(p => p.id === planoId ? { ...p, rotina, plan: fullPlan } : p),
   }));
   return this.getById(planoId);
 };
@@ -973,6 +1224,75 @@ planosModule.reagendarTopico = function(planoId, dateKey, topicoId) {
     });
     return { ...db, planos };
   });
+};
+
+// Importa uma aula já estudada: marca como concluída em data passada e adiciona revisões futuras
+planosModule.importarAulaJaEstudada = function(planoId, alunoId, topicId, completionDateKey, reviewIntervals) {
+  const plano = this.getById(planoId);
+  if (!plano) return;
+
+  // Busca o objeto do tópico no plano
+  let topicObj = null;
+  for (const day of Object.values(plano.plan)) {
+    const t = (day.topicos || []).find(t => t.id === topicId);
+    if (t) { topicObj = t; break; }
+  }
+  if (!topicObj) return;
+
+  const todayKey = localDateKey();
+  const progKey = `${completionDateKey}-${topicId}`;
+
+  // Marca como concluída com flag de importação manual
+  storage.set(db => {
+    const prog = db.progresso;
+    const idx = prog.findIndex(p => p.alunoId === alunoId && p.planoId === planoId && p.key === progKey);
+    if (idx >= 0) {
+      const updated = [...prog];
+      updated[idx] = { ...updated[idx], done: true, importado: true, importadoEm: new Date().toISOString() };
+      return { ...db, progresso: updated };
+    }
+    return { ...db, progresso: [...prog, { alunoId, planoId, key: progKey, done: true, importado: true, importadoEm: new Date().toISOString(), at: new Date().toISOString() }] };
+  });
+
+  // Remove a aula do plano futuro e reconstrói revisões
+  storage.set(db => {
+    const planos = db.planos.map(p => {
+      if (p.id !== planoId) return p;
+      const np = JSON.parse(JSON.stringify(p.plan));
+
+      // Remove a aula de todos os dias futuros (já está concluída)
+      Object.keys(np).forEach(dk => {
+        if (dk >= todayKey) {
+          np[dk].topicos = (np[dk].topicos || []).filter(t => t.id !== topicId);
+          // Remove revisões existentes para este tópico (serão recriadas abaixo)
+          if (reviewIntervals && reviewIntervals.length > 0) {
+            np[dk].reviews = (np[dk].reviews || []).filter(r => r.id !== topicId);
+          }
+        }
+      });
+
+      // Adiciona revisões futuras baseadas na data de conclusão
+      if (reviewIntervals && reviewIntervals.length > 0) {
+        const compD = new Date(completionDateKey + "T12:00:00");
+        reviewIntervals.forEach(interval => {
+          let revDate = new Date(compD);
+          revDate.setDate(revDate.getDate() + interval);
+          const revKey = localDateKey(revDate);
+          if (revKey < todayKey) return; // Revisões já passadas são ignoradas
+          if (!np[revKey]) np[revKey] = { date: revKey, topicos: [], reviews: [] };
+          if (!np[revKey].reviews.find(r => r.id === topicId && r.reviewInterval === interval)) {
+            np[revKey].reviews.push({ ...topicObj, reviewInterval: interval });
+          }
+        });
+      }
+
+      return { ...p, plan: np };
+    });
+    return { ...db, planos };
+  });
+
+  logModule.add(alunoId, `Aula importada manualmente: ${topicObj.name}`, { planoId, topicId, completionDateKey, reviewIntervals });
+  persistToSupabase();
 };
 
 // ============================================================
@@ -1190,6 +1510,8 @@ function AlunoOnboarding({ user, editais, onGenerate }) {
   const [rotinaMode, setRotinaMode] = useState("manual"); // "manual" | "data"
   const [dataFim, setDataFim] = useState("");
   const [maxRevisoes, setMaxRevisoes] = useState(5);
+  const [minRevisoes, setMinRevisoes] = useState(0);
+  const [modoOrganizacao, setModoOrganizacao] = useState("alternado");
   const [nivelCobertura, setNivelCobertura] = useState(["media"]); // array of selected levels: "alta", "media", "baixa"
   function setDayAulas(dow, val) {
     setDiasConfig(prev => ({ ...prev, [dow]: Math.max(0, Math.min(5, val)) }));
@@ -1209,8 +1531,6 @@ function AlunoOnboarding({ user, editais, onGenerate }) {
     const semanasSug = aulasSemSug > 0 ? Math.ceil(totalTop / aulasSemSug) : 0;
     return { diasTotal, semanasTotal: Math.ceil(semanasTotal), aulasSemanaNeed, apd: capped, sugestedCfg, semanasSug };
   }
-  const sugestao = rotinaMode === "data" ? calcSugestao() : null;
-
   const edital = editaisModule.getById(editalId);
 
   // When edital changes, default to all materias selected
@@ -1226,13 +1546,14 @@ function AlunoOnboarding({ user, editais, onGenerate }) {
 
   const selectedMaterias = edital ? edital.materias.filter(m => materiaIds.includes(m.id)) : [];
   const totalTop = selectedMaterias.reduce((a,m) => a + m.topicos.length, 0);
+  const sugestao = rotinaMode === "data" ? calcSugestao() : null;
   const aulasSem = Object.values(diasConfig).reduce((a,n) => a + n, 0);
   const semanas = aulasSem > 0 ? Math.ceil(totalTop / aulasSem) : 0;
   const previsao = semanas > 0 ? new Date(Date.now() + semanas*7*86400000).toLocaleDateString("pt-BR",{day:"2-digit",month:"long"}) : "—";
   const diasAtivos = Object.values(diasConfig).filter(n => n > 0).length;
 
   function handleGerar() {
-    planosModule.generate(user.id, editalId, { diasConfig, materiaIds, maxRevisoesPorDia: maxRevisoes, nivelCobertura });
+    planosModule.generate(user.id, editalId, { diasConfig, materiaIds, maxRevisoesPorDia: maxRevisoes, minRevisoesPorDia: minRevisoes, modoOrganizacao, nivelCobertura });
     onGenerate();
   }
 
@@ -1272,7 +1593,7 @@ function AlunoOnboarding({ user, editais, onGenerate }) {
           <div style={{textAlign:"center",marginBottom:20}}>
             <div style={{fontSize:26}}>📚</div>
             <h2 style={{fontSize:17,fontWeight:900,marginTop:6}}>Quais matérias estudar?</h2>
-            <p style={{color:"var(--t2)",fontSize:13,marginTop:3}}>Os tópicos serão alternados entre as matérias selecionadas</p>
+            <p style={{color:"var(--t2)",fontSize:13,marginTop:3}}>{modoOrganizacao==="sequencial"?"Cada disciplina será estudada em bloco antes da próxima":"Os tópicos serão alternados entre as matérias selecionadas"}</p>
           </div>
           <div style={{display:"flex",justifyContent:"flex-end",marginBottom:8,gap:8}}>
             <button className="btn btn-ghost btn-xs" onClick={()=>setMateriaIds(edital.materias.map(m=>m.id))}>Todas</button>
@@ -1282,7 +1603,7 @@ function AlunoOnboarding({ user, editais, onGenerate }) {
             {edital&&edital.materias.map(m=>{
               const sel = materiaIds.includes(m.id);
               return (
-                <div key={m.id} onClick={()=>toggleMateria(m.id)} style={{display:"flex",alignItems:"center",gap:12,padding:"11px 14px",borderRadius:10,border:`1.5px solid ${sel?"var(--green)":"var(--b2)"}`,background:sel?"var(--s2)":"var(--s1)",cursor:"pointer",transition:"all .15s"}}>
+              <div key={m.id} onClick={()=>toggleMateria(m.id)} style={{display:"flex",alignItems:"center",gap:12,padding:"11px 14px",borderRadius:10,border:`1.5px solid ${sel?"var(--green)":"var(--b2)"}`,background:sel?"var(--s2)":"var(--s1)",cursor:"pointer",transition:"all .15s"}}>
                   <div style={{width:12,height:12,borderRadius:"50%",background:m.color,flexShrink:0}}/>
                   <div style={{flex:1}}>
                     <div style={{fontWeight:700,fontSize:13,color:sel?"var(--green)":"var(--t1)"}}>{m.name}</div>
@@ -1296,6 +1617,21 @@ function AlunoOnboarding({ user, editais, onGenerate }) {
             })}
           </div>
           {materiaIds.length>0&&<div style={{marginTop:10,fontSize:12,color:"var(--t3)",textAlign:"center"}}>{materiaIds.length} matéria{materiaIds.length!==1?"s":""} · {totalTop} tópico{totalTop!==1?"s":""} selecionado{totalTop!==1?"s":""}</div>}
+          <div style={{marginTop:16,padding:"14px 16px",borderRadius:10,background:"var(--s2)",border:"1px solid var(--b1)"}}>
+            <div style={{fontSize:12,fontWeight:700,color:"var(--t2)",marginBottom:10}}>📚 Organização das matérias</div>
+            <div style={{display:"flex",gap:8}}>
+              <div onClick={()=>setModoOrganizacao("alternado")} style={{flex:1,padding:"10px 12px",borderRadius:8,border:`1.5px solid ${modoOrganizacao==="alternado"?"var(--green)":"var(--b2)"}`,background:modoOrganizacao==="alternado"?"rgba(34,211,165,0.07)":"transparent",cursor:"pointer",textAlign:"center",transition:"all .15s"}}>
+                <div style={{fontSize:16,marginBottom:4}}>🔀</div>
+                <div style={{fontSize:12,fontWeight:700,color:modoOrganizacao==="alternado"?"var(--green)":"var(--t1)"}}>Alternadas</div>
+                <div style={{fontSize:10,color:"var(--t3)",marginTop:2}}>Intercala matérias todo dia</div>
+              </div>
+              <div onClick={()=>setModoOrganizacao("sequencial")} style={{flex:1,padding:"10px 12px",borderRadius:8,border:`1.5px solid ${modoOrganizacao==="sequencial"?"var(--blue)":"var(--b2)"}`,background:modoOrganizacao==="sequencial"?"rgba(96,165,250,0.07)":"transparent",cursor:"pointer",textAlign:"center",transition:"all .15s"}}>
+                <div style={{fontSize:16,marginBottom:4}}>📖</div>
+                <div style={{fontSize:12,fontWeight:700,color:modoOrganizacao==="sequencial"?"var(--blue)":"var(--t1)"}}>Sequencial</div>
+                <div style={{fontSize:10,color:"var(--t3)",marginTop:2}}>Uma matéria por vez</div>
+              </div>
+            </div>
+          </div>
           <div style={{display:"flex",gap:10,marginTop:16}}>
             <button className="btn btn-ghost" style={{flex:1}} onClick={()=>setStep(1)}>← Voltar</button>
             <button className="btn btn-green" style={{flex:2}} disabled={materiaIds.length===0} onClick={()=>setStep(3)}>Continuar →</button>
@@ -1334,7 +1670,7 @@ function AlunoOnboarding({ user, editais, onGenerate }) {
                     </div>
                     <div style={{fontSize:12,color:"var(--t2)",textAlign:"center"}}>Seg a Sex, {sugestao.apd} aula{sugestao.apd>1?"s":""} por dia</div>
                   </div>
-                  <button className="btn btn-green" style={{width:"100%",marginBottom:8}} onClick={()=>{setDiasConfig(sugestao.sugestedCfg);planosModule.generate(user.id,editalId,{diasConfig:sugestao.sugestedCfg,materiaIds,maxRevisoesPorDia:maxRevisoes});onGenerate();}}>🚀 Criar plano automaticamente</button>
+                  <button className="btn btn-green" style={{width:"100%",marginBottom:8}} onClick={()=>{setDiasConfig(sugestao.sugestedCfg);planosModule.generate(user.id,editalId,{diasConfig:sugestao.sugestedCfg,materiaIds,maxRevisoesPorDia:maxRevisoes,minRevisoesPorDia:minRevisoes,modoOrganizacao,nivelCobertura});onGenerate();}}>🚀 Criar plano automaticamente</button>
                   <button className="btn btn-ghost" style={{width:"100%"}} onClick={()=>{setDiasConfig(sugestao.sugestedCfg);setRotinaMode("manual");}}>⚙️ Ajustar manualmente</button>
                 </div>
               ):(
@@ -1343,12 +1679,41 @@ function AlunoOnboarding({ user, editais, onGenerate }) {
               )}
               {/* Máx. revisões — também no modo automático */}
               <div style={{marginTop:16,padding:"14px 16px",borderRadius:10,background:"var(--s2)",border:"1px solid var(--b1)"}}>
-                <div style={{fontSize:12,fontWeight:700,color:"var(--t2)",marginBottom:10}}>🔁 Máx. revisões por dia</div>
-                <div style={{display:"flex",alignItems:"center",gap:10}}>
-                  <button onClick={()=>setMaxRevisoes(r=>Math.max(1,r-1))} style={{width:30,height:30,borderRadius:7,border:"1.5px solid var(--b2)",background:"var(--s3)",cursor:"pointer",fontSize:16,fontWeight:700,color:"var(--t2)",display:"flex",alignItems:"center",justifyContent:"center"}}>−</button>
-                  <span style={{fontFamily:"Cabinet Grotesk",fontWeight:900,fontSize:20,color:"var(--amber)",minWidth:32,textAlign:"center"}}>{maxRevisoes}</span>
-                  <button onClick={()=>setMaxRevisoes(r=>Math.min(20,r+1))} style={{width:30,height:30,borderRadius:7,border:"1.5px solid var(--b2)",background:"var(--s3)",cursor:"pointer",fontSize:16,fontWeight:700,color:"var(--t2)",display:"flex",alignItems:"center",justifyContent:"center"}}>+</button>
-                  <span style={{fontSize:11,color:"var(--t3)",marginLeft:4}}>revisões/dia — excedente vai pro próximo dia</span>
+                <div style={{fontSize:12,fontWeight:700,color:"var(--t2)",marginBottom:12}}>📚 Organização das matérias</div>
+                <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                  <label style={{display:"flex",alignItems:"flex-start",gap:10,padding:"10px 12px",borderRadius:8,border:`1.5px solid ${modoOrganizacao==="alternado"?"var(--green)":"var(--b2)"}`,background:modoOrganizacao==="alternado"?"rgba(34,211,165,0.07)":"transparent",cursor:"pointer",transition:"all .15s"}} onClick={()=>setModoOrganizacao("alternado")}>
+                    <input type="radio" checked={modoOrganizacao==="alternado"} onChange={()=>setModoOrganizacao("alternado")} style={{marginTop:2,accentColor:"var(--green)"}}/>
+                    <div>
+                      <div style={{fontSize:13,fontWeight:700,color:"var(--t1)"}}>🔀 Matérias alternadas</div>
+                      <div style={{fontSize:11,color:"var(--t3)",marginTop:2}}>As disciplinas se intercalam dia a dia — mais variedade e melhor retenção</div>
+                    </div>
+                  </label>
+                  <label style={{display:"flex",alignItems:"flex-start",gap:10,padding:"10px 12px",borderRadius:8,border:`1.5px solid ${modoOrganizacao==="sequencial"?"var(--blue)":"var(--b2)"}`,background:modoOrganizacao==="sequencial"?"rgba(96,165,250,0.07)":"transparent",cursor:"pointer",transition:"all .15s"}} onClick={()=>setModoOrganizacao("sequencial")}>
+                    <input type="radio" checked={modoOrganizacao==="sequencial"} onChange={()=>setModoOrganizacao("sequencial")} style={{marginTop:2,accentColor:"var(--blue)"}}/>
+                    <div>
+                      <div style={{fontSize:13,fontWeight:700,color:"var(--t1)"}}>📖 Matérias sequenciais</div>
+                      <div style={{fontSize:11,color:"var(--t3)",marginTop:2}}>Cada disciplina é concluída em bloco antes de passar para a próxima</div>
+                    </div>
+                  </label>
+                </div>
+              </div>
+              <div style={{marginTop:16,padding:"14px 16px",borderRadius:10,background:"var(--s2)",border:"1px solid var(--b1)"}}>
+                <div style={{fontSize:12,fontWeight:700,color:"var(--t2)",marginBottom:12}}>🔁 Revisões por dia</div>
+                <div style={{display:"flex",flexDirection:"column",gap:10}}>
+                  <div style={{display:"flex",alignItems:"center",gap:10}}>
+                    <span style={{fontSize:11,color:"var(--t3)",width:50}}>Mínimo</span>
+                    <button onClick={()=>setMinRevisoes(r=>Math.max(0,r-1))} style={{width:28,height:28,borderRadius:7,border:"1.5px solid var(--b2)",background:"var(--s3)",cursor:"pointer",fontSize:15,fontWeight:700,color:"var(--t2)",display:"flex",alignItems:"center",justifyContent:"center"}}>−</button>
+                    <span style={{fontFamily:"Cabinet Grotesk",fontWeight:900,fontSize:18,color:"var(--blue)",minWidth:28,textAlign:"center"}}>{minRevisoes === 0 ? "—" : minRevisoes}</span>
+                    <button onClick={()=>setMinRevisoes(r=>Math.min(maxRevisoes,r+1))} style={{width:28,height:28,borderRadius:7,border:"1.5px solid var(--b2)",background:"var(--s3)",cursor:"pointer",fontSize:15,fontWeight:700,color:"var(--t2)",display:"flex",alignItems:"center",justifyContent:"center"}}>+</button>
+                    <span style={{fontSize:11,color:"var(--t3)"}}>puxar adiantadas p/ completar</span>
+                  </div>
+                  <div style={{display:"flex",alignItems:"center",gap:10}}>
+                    <span style={{fontSize:11,color:"var(--t3)",width:50}}>Máximo</span>
+                    <button onClick={()=>setMaxRevisoes(r=>{const v=Math.max(1,r-1);if(minRevisoes>v)setMinRevisoes(v);return v;})} style={{width:28,height:28,borderRadius:7,border:"1.5px solid var(--b2)",background:"var(--s3)",cursor:"pointer",fontSize:15,fontWeight:700,color:"var(--t2)",display:"flex",alignItems:"center",justifyContent:"center"}}>−</button>
+                    <span style={{fontFamily:"Cabinet Grotesk",fontWeight:900,fontSize:18,color:"var(--amber)",minWidth:28,textAlign:"center"}}>{maxRevisoes}</span>
+                    <button onClick={()=>setMaxRevisoes(r=>Math.min(20,r+1))} style={{width:28,height:28,borderRadius:7,border:"1.5px solid var(--b2)",background:"var(--s3)",cursor:"pointer",fontSize:15,fontWeight:700,color:"var(--t2)",display:"flex",alignItems:"center",justifyContent:"center"}}>+</button>
+                    <span style={{fontSize:11,color:"var(--t3)"}}>excedente vai pro próximo dia</span>
+                  </div>
                 </div>
               </div>
               <div style={{display:"flex",gap:10,marginTop:16}}>
@@ -1377,12 +1742,41 @@ function AlunoOnboarding({ user, editais, onGenerate }) {
               </div>
               {aulasSem>0&&<div style={{marginTop:10,fontSize:12,color:"var(--t3)",textAlign:"center"}}>{aulasSem} aula{aulasSem!==1?"s":""}/semana · {diasAtivos} dia{diasAtivos!==1?"s":""} ativos</div>}
               <div style={{marginTop:16,padding:"14px 16px",borderRadius:10,background:"var(--s2)",border:"1px solid var(--b1)"}}>
-                <div style={{fontSize:12,fontWeight:700,color:"var(--t2)",marginBottom:10}}>🔁 Máx. revisões por dia</div>
-                <div style={{display:"flex",alignItems:"center",gap:10}}>
-                  <button onClick={()=>setMaxRevisoes(r=>Math.max(1,r-1))} style={{width:30,height:30,borderRadius:7,border:"1.5px solid var(--b2)",background:"var(--s3)",cursor:"pointer",fontSize:16,fontWeight:700,color:"var(--t2)",display:"flex",alignItems:"center",justifyContent:"center"}}>−</button>
-                  <span style={{fontFamily:"Cabinet Grotesk",fontWeight:900,fontSize:20,color:"var(--amber)",minWidth:32,textAlign:"center"}}>{maxRevisoes}</span>
-                  <button onClick={()=>setMaxRevisoes(r=>Math.min(20,r+1))} style={{width:30,height:30,borderRadius:7,border:"1.5px solid var(--b2)",background:"var(--s3)",cursor:"pointer",fontSize:16,fontWeight:700,color:"var(--t2)",display:"flex",alignItems:"center",justifyContent:"center"}}>+</button>
-                  <span style={{fontSize:11,color:"var(--t3)",marginLeft:4}}>revisões/dia — excedente vai pro próximo dia</span>
+                <div style={{fontSize:12,fontWeight:700,color:"var(--t2)",marginBottom:12}}>📚 Organização das matérias</div>
+                <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                  <label style={{display:"flex",alignItems:"flex-start",gap:10,padding:"10px 12px",borderRadius:8,border:`1.5px solid ${modoOrganizacao==="alternado"?"var(--green)":"var(--b2)"}`,background:modoOrganizacao==="alternado"?"rgba(34,211,165,0.07)":"transparent",cursor:"pointer",transition:"all .15s"}} onClick={()=>setModoOrganizacao("alternado")}>
+                    <input type="radio" checked={modoOrganizacao==="alternado"} onChange={()=>setModoOrganizacao("alternado")} style={{marginTop:2,accentColor:"var(--green)"}}/>
+                    <div>
+                      <div style={{fontSize:13,fontWeight:700,color:"var(--t1)"}}>🔀 Matérias alternadas</div>
+                      <div style={{fontSize:11,color:"var(--t3)",marginTop:2}}>As disciplinas se intercalam dia a dia — mais variedade e melhor retenção</div>
+                    </div>
+                  </label>
+                  <label style={{display:"flex",alignItems:"flex-start",gap:10,padding:"10px 12px",borderRadius:8,border:`1.5px solid ${modoOrganizacao==="sequencial"?"var(--blue)":"var(--b2)"}`,background:modoOrganizacao==="sequencial"?"rgba(96,165,250,0.07)":"transparent",cursor:"pointer",transition:"all .15s"}} onClick={()=>setModoOrganizacao("sequencial")}>
+                    <input type="radio" checked={modoOrganizacao==="sequencial"} onChange={()=>setModoOrganizacao("sequencial")} style={{marginTop:2,accentColor:"var(--blue)"}}/>
+                    <div>
+                      <div style={{fontSize:13,fontWeight:700,color:"var(--t1)"}}>📖 Matérias sequenciais</div>
+                      <div style={{fontSize:11,color:"var(--t3)",marginTop:2}}>Cada disciplina é concluída em bloco antes de passar para a próxima</div>
+                    </div>
+                  </label>
+                </div>
+              </div>
+              <div style={{marginTop:16,padding:"14px 16px",borderRadius:10,background:"var(--s2)",border:"1px solid var(--b1)"}}>
+                <div style={{fontSize:12,fontWeight:700,color:"var(--t2)",marginBottom:12}}>🔁 Revisões por dia</div>
+                <div style={{display:"flex",flexDirection:"column",gap:10}}>
+                  <div style={{display:"flex",alignItems:"center",gap:10}}>
+                    <span style={{fontSize:11,color:"var(--t3)",width:50}}>Mínimo</span>
+                    <button onClick={()=>setMinRevisoes(r=>Math.max(0,r-1))} style={{width:28,height:28,borderRadius:7,border:"1.5px solid var(--b2)",background:"var(--s3)",cursor:"pointer",fontSize:15,fontWeight:700,color:"var(--t2)",display:"flex",alignItems:"center",justifyContent:"center"}}>−</button>
+                    <span style={{fontFamily:"Cabinet Grotesk",fontWeight:900,fontSize:18,color:"var(--blue)",minWidth:28,textAlign:"center"}}>{minRevisoes === 0 ? "—" : minRevisoes}</span>
+                    <button onClick={()=>setMinRevisoes(r=>Math.min(maxRevisoes,r+1))} style={{width:28,height:28,borderRadius:7,border:"1.5px solid var(--b2)",background:"var(--s3)",cursor:"pointer",fontSize:15,fontWeight:700,color:"var(--t2)",display:"flex",alignItems:"center",justifyContent:"center"}}>+</button>
+                    <span style={{fontSize:11,color:"var(--t3)"}}>puxar adiantadas p/ completar</span>
+                  </div>
+                  <div style={{display:"flex",alignItems:"center",gap:10}}>
+                    <span style={{fontSize:11,color:"var(--t3)",width:50}}>Máximo</span>
+                    <button onClick={()=>setMaxRevisoes(r=>{const v=Math.max(1,r-1);if(minRevisoes>v)setMinRevisoes(v);return v;})} style={{width:28,height:28,borderRadius:7,border:"1.5px solid var(--b2)",background:"var(--s3)",cursor:"pointer",fontSize:15,fontWeight:700,color:"var(--t2)",display:"flex",alignItems:"center",justifyContent:"center"}}>−</button>
+                    <span style={{fontFamily:"Cabinet Grotesk",fontWeight:900,fontSize:18,color:"var(--amber)",minWidth:28,textAlign:"center"}}>{maxRevisoes}</span>
+                    <button onClick={()=>setMaxRevisoes(r=>Math.min(20,r+1))} style={{width:28,height:28,borderRadius:7,border:"1.5px solid var(--b2)",background:"var(--s3)",cursor:"pointer",fontSize:15,fontWeight:700,color:"var(--t2)",display:"flex",alignItems:"center",justifyContent:"center"}}>+</button>
+                    <span style={{fontSize:11,color:"var(--t3)"}}>excedente vai pro próximo dia</span>
+                  </div>
                 </div>
               </div>
               <div style={{display:"flex",gap:10,marginTop:16}}>
@@ -1409,9 +1803,15 @@ function AlunoOnboarding({ user, editais, onGenerate }) {
               <div style={{textAlign:"center"}}><div style={{fontSize:20,fontWeight:900,fontFamily:"Cabinet Grotesk",color:"var(--amber)"}}>{diasAtivos}×/sem</div><div style={{fontSize:11,color:"var(--t3)",fontWeight:700,textTransform:"uppercase",letterSpacing:1}}>Frequência</div></div>
               <div style={{textAlign:"center"}}><div style={{fontSize:13,fontWeight:700,fontFamily:"Cabinet Grotesk",color:"var(--t1)",marginTop:3}}>{previsao}</div><div style={{fontSize:11,color:"var(--t3)",fontWeight:700,textTransform:"uppercase",letterSpacing:1}}>Previsão</div></div>
             </div>
-            <div style={{borderTop:"1px solid var(--b1)",marginTop:14,paddingTop:12,textAlign:"center"}}>
-              <span style={{fontSize:12,color:"var(--t3)"}}>🔁 Máx. revisões por dia: </span>
-              <span style={{fontFamily:"Cabinet Grotesk",fontWeight:900,fontSize:14,color:"var(--amber)"}}>{maxRevisoes}</span>
+            <div style={{borderTop:"1px solid var(--b1)",marginTop:14,paddingTop:12,display:"flex",justifyContent:"center",gap:20}}>
+              <div style={{textAlign:"center"}}>
+                <div style={{fontFamily:"Cabinet Grotesk",fontWeight:900,fontSize:16,color:"var(--blue)"}}>{minRevisoes === 0 ? "—" : minRevisoes}</div>
+                <div style={{fontSize:11,color:"var(--t3)"}}>mín. revisões/dia</div>
+              </div>
+              <div style={{textAlign:"center"}}>
+                <div style={{fontFamily:"Cabinet Grotesk",fontWeight:900,fontSize:16,color:"var(--amber)"}}>{maxRevisoes}</div>
+                <div style={{fontSize:11,color:"var(--t3)"}}>máx. revisões/dia</div>
+              </div>
             </div>
           </div>
           <div style={{marginBottom:14}}>
@@ -1513,8 +1913,24 @@ function EstudarAgoraModal({ user, plano, onClose, onRefresh }) {
   const [noteText, setNoteText] = useState("");
   const [tick, setTick] = useState(0);
   const [showMaterials, setShowMaterials] = useState(false);
+  const [showPrompt, setShowPrompt] = useState(false);
+  const [promptTipo, setPromptTipo] = useState(null);
+  const [promptCopiado, setPromptCopiado] = useState(false);
+  // Fluxo "Aula Já Estudada"
+  const [jaEstudada, setJaEstudada] = useState(false);
+  const [jaEstudadaDate, setJaEstudadaDate] = useState("");
+  const [comRevisao, setComRevisao] = useState(null); // null | true | false
+  const [revisaoPreset, setRevisaoPreset] = useState("moderada");
+  const [customIntervals, setCustomIntervals] = useState("");
   const dayData = plano.plan[today] || { topicos:[], reviews:[] };
-  const pending = dayData.topicos.filter(t => !progressoModule.isDone(user.id, plano.id, `${today}-${t.id}`));
+  // Combina aulas pendentes + revisões pendentes (aulas primeiro)
+  const pendingLessons = (dayData.topicos || [])
+    .filter(t => !progressoModule.isDone(user.id, plano.id, `${today}-${t.id}`))
+    .map(t => ({ ...t, _type: "lesson" }));
+  const pendingReviews = (dayData.reviews || [])
+    .filter(t => !progressoModule.isDone(user.id, plano.id, `${today}-${t.id}-rev`))
+    .map(t => ({ ...t, _type: "review" }));
+  const pending = [...pendingLessons, ...pendingReviews];
   const xpGanho = concluidos * 10;
   const currentTopic = pending[idx];
 
@@ -1539,7 +1955,7 @@ function EstudarAgoraModal({ user, plano, onClose, onRefresh }) {
 
   const topicMaterials = currentTopic ? getMaterialFiles(currentTopic.id) : [];
 
-  // Load note whenever topic changes
+  // Carrega nota sempre que o tópico muda
   useEffect(() => {
     if (currentTopic) {
       setNoteText(progressoModule.getNote(user.id, plano.id, currentTopic.id));
@@ -1549,15 +1965,165 @@ function EstudarAgoraModal({ user, plano, onClose, onRefresh }) {
   function avanca() { if (idx+1 >= pending.length) setIdx(pending.length); else setIdx(i=>i+1); }
   function handleOk() {
     if (noteText.trim()) progressoModule.saveNote(user.id, plano.id, currentTopic.id, noteText.trim());
-    progressoModule.toggle(user.id, plano.id, `${today}-${currentTopic.id}`);
+    const progKey = currentTopic._type === "review"
+      ? `${today}-${currentTopic.id}-rev`
+      : `${today}-${currentTopic.id}`;
+    progressoModule.saveDone(user.id, plano.id, progKey);
     setConcluidos(c=>c+1); avanca(); onRefresh(); setTick(t=>t+1);
   }
   function handlePular() {
     if (noteText.trim()) progressoModule.saveNote(user.id, plano.id, currentTopic.id, noteText.trim());
-    planosModule.reagendarTopico(plano.id, today, currentTopic.id);
+    if (currentTopic._type === "lesson") {
+      if (noteText.trim()) {
+        // Aluno enviou resumo → considera aula concluída
+        const progKey = `${today}-${currentTopic.id}`;
+        progressoModule.saveDone(user.id, plano.id, progKey);
+        setConcluidos(c=>c+1);
+      } else {
+        planosModule.reagendarTopico(plano.id, today, currentTopic.id);
+      }
+    }
     avanca(); onRefresh(); setTick(t=>t+1);
   }
+  function handleImportarAula() {
+    if (!jaEstudadaDate) { alert("Informe a data em que você concluiu a aula."); return; }
+    if (comRevisao === null) { alert("Informe se deseja incluir no cronograma de revisão."); return; }
+    let intervals = null;
+    if (comRevisao) {
+      if (revisaoPreset === "personalizado") {
+        intervals = customIntervals.split(",").map(s => parseInt(s.trim())).filter(n => !isNaN(n) && n > 0);
+        if (intervals.length === 0) { alert("Informe pelo menos um intervalo válido (ex: 1, 7, 21)."); return; }
+      } else {
+        intervals = REVIEW_PRESETS[revisaoPreset] || [1, 7, 21, 30];
+      }
+    }
+    if (noteText.trim()) progressoModule.saveNote(user.id, plano.id, currentTopic.id, noteText.trim());
+    planosModule.importarAulaJaEstudada(plano.id, user.id, currentTopic.id, jaEstudadaDate, intervals);
+    setJaEstudada(false); setJaEstudadaDate(""); setComRevisao(null); setRevisaoPreset("moderada"); setCustomIntervals("");
+    setConcluidos(c=>c+1); avanca(); onRefresh(); setTick(t=>t+1);
+  }
   const finished = idx >= pending.length;
+
+  const PROMPT_TIPOS = [
+    { id:"resumo",      icon:"📖", label:"Resumo completo",          desc:"Síntese clara e objetiva do conteúdo" },
+    { id:"aula",        icon:"🎓", label:"Aula completa",            desc:"Explicação detalhada como um professor" },
+    { id:"mapa",        icon:"🧠", label:"Mapa mental",              desc:"Estrutura hierárquica dos conceitos" },
+    { id:"exercicios",  icon:"💪", label:"Exercícios práticos",      desc:"Lista de questões para fixação" },
+    { id:"revisao",     icon:"⚡", label:"Revisão rápida",           desc:"Os pontos mais importantes em bullet points" },
+    { id:"iniciante",   icon:"🔰", label:"Para iniciantes",          desc:"Explicação simples do zero" },
+    { id:"questoes",    icon:"📝", label:"Questões comentadas",      desc:"Questões de concurso com gabarito e comentário" },
+    { id:"fichamento",  icon:"🗂️", label:"Fichamento",              desc:"Fichamento completo para anotação" },
+  ];
+
+  function gerarPrompt(tipo) {
+    const topico = currentTopic?.name || "tópico";
+    const materia = currentTopic?.materiaName || "matéria";
+    switch(tipo) {
+      case "resumo":
+        return `Faça um resumo completo e didático sobre "${topico}" dentro do contexto de ${materia}.
+
+O resumo deve:
+- Explicar o conceito principal de forma clara
+- Destacar os pontos mais importantes
+- Apresentar exemplos práticos quando possível
+- Ser organizado em tópicos com linguagem acessível
+- Focar nos aspectos cobrados em concursos públicos`;
+      case "aula":
+        return `Atue como um professor especialista em ${materia} e dê uma aula completa sobre "${topico}".
+
+A aula deve seguir esta estrutura:
+1. Introdução e contexto
+2. Conceito e definição
+3. Desenvolvimento com exemplos
+4. Pontos de atenção e pegadinhas de prova
+5. Resumo final com os tópicos mais importantes
+
+Use linguagem clara e didática, como se estivesse explicando para um concurseiro.`;
+      case "mapa":
+        return `Crie um mapa mental completo sobre "${topico}" (${materia}).
+
+Estruture da seguinte forma:
+- Conceito central: ${topico}
+  - Subtópico 1: [principais aspectos]
+  - Subtópico 2: [divisões importantes]
+  - Subtópico 3: [exemplos e aplicações]
+  - Subtópico 4: [pontos cobrados em prova]
+
+Use hierarquia clara com recuo, emojis para facilitar memorização e destaque os conceitos mais cobrados em concursos.`;
+      case "exercicios":
+        return `Crie uma lista de 10 exercícios práticos sobre "${topico}" (${materia}) para fixação do conteúdo.
+
+Para cada exercício:
+- Apresente a questão
+- Dê o gabarito comentado logo abaixo
+- Explique o raciocínio da resposta
+
+Varie os tipos: verdadeiro/falso, múltipla escolha, dissertativas curtas. Foque no que costuma ser cobrado em concursos públicos.`;
+      case "revisao":
+        return `Faça uma revisão rápida e objetiva de "${topico}" (${materia}) em formato de bullet points.
+
+Inclua:
+✅ Definição em 1 linha
+📌 5 a 10 pontos essenciais para memorizar
+⚠️ Principais pegadinhas e erros comuns
+🎯 O que mais cai em concurso sobre este tema
+
+Seja direto e conciso — máximo 300 palavras.`;
+      case "iniciante":
+        return `Explique "${topico}" (${materia}) para alguém que nunca teve contato com o assunto.
+
+Use:
+- Linguagem simples, sem jargões técnicos
+- Analogias do cotidiano para facilitar o entendimento
+- Exemplos práticos e concretos
+- Progressão lógica do mais simples ao mais complexo
+
+Ao final, liste 3 conceitos-chave que o iniciante deve memorizar.`;
+      case "questoes":
+        return `Crie 5 questões estilo concurso público sobre "${topico}" (${materia}), com gabarito e comentário.
+
+Formato para cada questão:
+
+Questão [N]: [Texto da questão]
+a) [alternativa]
+b) [alternativa]
+c) [alternativa]
+d) [alternativa]
+e) [alternativa]
+
+Gabarito: [letra]
+Comentário: [explicação detalhada do porquê a resposta está correta e por que as demais estão erradas]
+
+Baseie as questões em bancas como CESPE/Cebraspe, FGV e FCC.`;
+      case "fichamento":
+        return `Faça um fichamento completo de "${topico}" (${materia}) para servir como material de estudo.
+
+Estruture assim:
+
+📌 TEMA: ${topico}
+📚 MATÉRIA: ${materia}
+
+1. DEFINIÇÃO
+[definição objetiva]
+
+2. PONTOS PRINCIPAIS
+[lista dos conceitos centrais]
+
+3. DETALHAMENTO
+[explicação aprofundada de cada ponto]
+
+4. EXEMPLOS
+[exemplos práticos e casos concretos]
+
+5. PALAVRAS-CHAVE
+[termos importantes para memorizar]
+
+6. O QUE CAI EM PROVA
+[principais cobranças de concurso sobre o tema]`;
+      default: return "";
+    }
+  }
+
   return (
     <div className="overlay" onClick={e=>{if(e.target===e.currentTarget)onClose();}}>
       {/* Modal de Materiais */}
@@ -1616,7 +2182,9 @@ function EstudarAgoraModal({ user, plano, onClose, onRefresh }) {
             <div style={{fontSize:56,marginBottom:12}}>{pending.length===0?"😎":"🎉"}</div>
             <h2 style={{fontSize:22,fontWeight:900,marginBottom:8}}>{pending.length===0?"Tudo feito hoje!":"Sessão concluída!"}</h2>
             <p style={{color:"var(--t2)",marginBottom:20}}>
-              {pending.length===0?"Você já completou todas as aulas de hoje.":"Você completou "+concluidos+" aula"+(concluidos!==1?"s":"")+" nessa sessão."}
+              {pending.length===0
+                ? "Você já completou todas as aulas e revisões de hoje."
+                : `Você completou ${concluidos} item${concluidos!==1?"s":""} nessa sessão.`}
             </p>
             {xpGanho>0&&<div className="badge bg" style={{fontSize:13,padding:"7px 16px",marginBottom:20}}>+{xpGanho} XP ganho! 🔥</div>}
             <button className="btn btn-green" style={{width:"100%"}} onClick={onClose}>Fechar</button>
@@ -1625,8 +2193,15 @@ function EstudarAgoraModal({ user, plano, onClose, onRefresh }) {
           <>
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
               <div>
-                <div style={{fontSize:11,fontWeight:700,letterSpacing:1,textTransform:"uppercase",color:"var(--t3)"}}>Aula {idx+1} de {pending.length}</div>
-                <h2 style={{fontSize:18,fontWeight:900}}>▶ Estudar Agora</h2>
+                <div style={{fontSize:11,fontWeight:700,letterSpacing:1,textTransform:"uppercase",color:"var(--t3)"}}>
+                  {currentTopic._type === "review" ? `Revisão ${idx - pendingLessons.length + 1} de ${pendingReviews.length}` : `Aula ${idx+1} de ${pendingLessons.length}`}
+                  {pendingReviews.length > 0 && pendingLessons.length > 0 && (
+                    <span style={{marginLeft:8,color:"var(--amber)"}}>• {pendingReviews.length} revisão{pendingReviews.length!==1?"ões":""} pendente{pendingReviews.length!==1?"s":""}</span>
+                  )}
+                </div>
+                <h2 style={{fontSize:18,fontWeight:900}}>
+                  {currentTopic._type === "review" ? "🔁 Revisão" : "▶ Estudar Agora"}
+                </h2>
               </div>
               <button className="modal-x" onClick={onClose}>✕</button>
             </div>
@@ -1667,19 +2242,141 @@ function EstudarAgoraModal({ user, plano, onClose, onRefresh }) {
               >
                 📎 {topicMaterials.length > 0 ? `Ver ${topicMaterials.length} material${topicMaterials.length !== 1 ? "is" : ""}` : "Sem materiais"}
               </button>
+              <button
+                onClick={() => { setShowPrompt(p => !p); setPromptTipo(null); setPromptCopiado(false); }}
+                style={{ marginTop:8, padding:"8px 14px", borderRadius:6, background:showPrompt?"var(--green)":"var(--s3)", color:showPrompt?"#07080f":"var(--t2)", border:showPrompt?"none":"1px solid var(--b2)", fontSize:12, fontWeight:600, cursor:"pointer", display:"inline-flex", alignItems:"center", gap:6, transition:"all 0.15s" }}
+              >
+                🤖 {showPrompt ? "Fechar Prompt IA" : "Gerar Prompt de IA"}
+              </button>
             </div>
+
+            {/* Painel de Prompt IA */}
+            {showPrompt && (
+              <div style={{ marginBottom:16, padding:"14px 16px", borderRadius:10, background:"var(--s2)", border:"1px solid rgba(34,211,165,0.3)" }}>
+                <div style={{ fontSize:12, fontWeight:700, color:"var(--green)", marginBottom:10, display:"flex", alignItems:"center", gap:6 }}>
+                  🤖 Gerar Prompt de IA
+                </div>
+                {!promptTipo ? (
+                  <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:6 }}>
+                    {PROMPT_TIPOS.map(pt => (
+                      <button key={pt.id} onClick={() => setPromptTipo(pt.id)} style={{ padding:"8px 10px", borderRadius:8, border:"1px solid var(--b2)", background:"var(--s3)", cursor:"pointer", textAlign:"left", transition:"all .15s" }}
+                        onMouseEnter={e=>e.currentTarget.style.borderColor="var(--green)"}
+                        onMouseLeave={e=>e.currentTarget.style.borderColor="var(--b2)"}
+                      >
+                        <div style={{ fontSize:15, marginBottom:2 }}>{pt.icon}</div>
+                        <div style={{ fontSize:11, fontWeight:700, color:"var(--t1)" }}>{pt.label}</div>
+                        <div style={{ fontSize:10, color:"var(--t3)", marginTop:2 }}>{pt.desc}</div>
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div>
+                    <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:10 }}>
+                      <button onClick={() => { setPromptTipo(null); setPromptCopiado(false); }} style={{ padding:"4px 10px", borderRadius:6, border:"1px solid var(--b2)", background:"var(--s3)", fontSize:11, cursor:"pointer", color:"var(--t2)" }}>
+                        ← Voltar
+                      </button>
+                      <span style={{ fontSize:12, fontWeight:700, color:"var(--t2)" }}>
+                        {PROMPT_TIPOS.find(p=>p.id===promptTipo)?.icon} {PROMPT_TIPOS.find(p=>p.id===promptTipo)?.label}
+                      </span>
+                    </div>
+                    <div style={{ background:"var(--s1)", borderRadius:8, padding:"12px 14px", fontSize:12, color:"var(--t2)", lineHeight:1.6, whiteSpace:"pre-wrap", maxHeight:200, overflowY:"auto", border:"1px solid var(--b2)", marginBottom:10, fontFamily:"monospace" }}>
+                      {gerarPrompt(promptTipo)}
+                    </div>
+                    <button
+                      onClick={() => {
+                        navigator.clipboard.writeText(gerarPrompt(promptTipo));
+                        setPromptCopiado(true);
+                        setTimeout(() => setPromptCopiado(false), 2500);
+                      }}
+                      style={{ width:"100%", padding:"10px", borderRadius:8, border:"none", background:promptCopiado?"var(--green)":"var(--blue)", color:promptCopiado?"#07080f":"white", fontSize:13, fontWeight:700, cursor:"pointer", fontFamily:"Cabinet Grotesk", transition:"all .2s" }}
+                    >
+                      {promptCopiado ? "✅ Copiado! Cole na IA agora" : "📋 Copiar Prompt"}
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Aula Já Estudada */}
+            {currentTopic._type === "lesson" && (
+              <div style={{marginBottom:14,padding:"12px 14px",borderRadius:8,background:"var(--s2)",border:`1px solid ${jaEstudada?"var(--green)":"var(--b2)"}`,transition:"border-color .2s"}}>
+                <label style={{display:"flex",alignItems:"center",gap:10,cursor:"pointer"}}>
+                  <input type="checkbox" checked={jaEstudada} onChange={e=>{setJaEstudada(e.target.checked);if(!e.target.checked){setComRevisao(null);setJaEstudadaDate("");}}} style={{width:16,height:16,accentColor:"var(--green)",cursor:"pointer"}}/>
+                  <span style={{fontSize:13,fontWeight:700,color:jaEstudada?"var(--green)":"var(--t1)"}}>✅ Aula Já Estudada</span>
+                </label>
+                {jaEstudada && (
+                  <div style={{marginTop:14,display:"flex",flexDirection:"column",gap:14}}>
+                    <div>
+                      <label style={{fontSize:11,fontWeight:700,letterSpacing:.6,textTransform:"uppercase",color:"var(--t3)",display:"block",marginBottom:6}}>📅 Quando você concluiu esta aula?</label>
+                      <input type="date" className="inp" value={jaEstudadaDate} onChange={e=>setJaEstudadaDate(e.target.value)} max={today} style={{fontSize:13,padding:"8px 12px"}}/>
+                    </div>
+                    <div>
+                      <label style={{fontSize:11,fontWeight:700,letterSpacing:.6,textTransform:"uppercase",color:"var(--t3)",display:"block",marginBottom:8}}>Incluir no cronograma de revisão?</label>
+                      <div style={{display:"flex",gap:8}}>
+                        {[{v:true,l:"✅ Sim"},{v:false,l:"❌ Não"}].map(({v,l})=>(
+                          <label key={String(v)} style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer",padding:"8px 0",borderRadius:8,background:comRevisao===v?"var(--green-d)":"var(--s3)",border:`1px solid ${comRevisao===v?"var(--green)":"var(--b2)"}`,flex:1,justifyContent:"center",transition:"all .15s"}}>
+                            <input type="radio" name="comRevisao" checked={comRevisao===v} onChange={()=>setComRevisao(v)} style={{accentColor:"var(--green)"}}/>
+                            <span style={{fontSize:13,fontWeight:600}}>{l}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                    {comRevisao===true && (
+                      <div>
+                        <label style={{fontSize:11,fontWeight:700,letterSpacing:.6,textTransform:"uppercase",color:"var(--t3)",display:"block",marginBottom:8}}>Modelo de Revisão Espaçada</label>
+                        <div style={{display:"flex",flexDirection:"column",gap:6}}>
+                          {[
+                            {key:"baixa",     label:"Baixa",       desc:"3 revisões: 1, 14, 21 dias"},
+                            {key:"moderada",  label:"Moderada",    desc:"4 revisões: 1, 7, 21, 30 dias"},
+                            {key:"intensa",   label:"Intensa",     desc:"5 revisões: 1, 7, 14, 21, 30 dias"},
+                            {key:"personalizado",label:"Personalizado",desc:"Defina seus próprios intervalos"},
+                          ].map(({key,label,desc})=>(
+                            <label key={key} style={{display:"flex",alignItems:"center",gap:10,cursor:"pointer",padding:"10px 12px",borderRadius:8,background:revisaoPreset===key?"var(--blue-d)":"var(--s3)",border:`1px solid ${revisaoPreset===key?"var(--blue)":"var(--b2)"}`,transition:"all .15s"}}>
+                              <input type="radio" name="revisaoPreset" checked={revisaoPreset===key} onChange={()=>setRevisaoPreset(key)} style={{accentColor:"var(--blue)"}}/>
+                              <div>
+                                <div style={{fontSize:13,fontWeight:700}}>{label}</div>
+                                <div style={{fontSize:11,color:"var(--t3)"}}>{desc}</div>
+                              </div>
+                            </label>
+                          ))}
+                        </div>
+                        {revisaoPreset==="personalizado" && (
+                          <div style={{marginTop:10}}>
+                            <label style={{fontSize:11,fontWeight:700,letterSpacing:.6,textTransform:"uppercase",color:"var(--t3)",display:"block",marginBottom:6}}>Intervalos em dias (separados por vírgula)</label>
+                            <input type="text" className="inp" value={customIntervals} onChange={e=>setCustomIntervals(e.target.value)} placeholder="Ex: 1, 3, 7, 15, 30" style={{fontSize:13,padding:"8px 12px"}}/>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
             <div style={{marginBottom:16}}>
-              <label style={{fontSize:11,fontWeight:700,letterSpacing:.6,textTransform:"uppercase",color:"var(--t3)",display:"block",marginBottom:7}}>📝 Resumo / Anotações</label>
+              <label style={{fontSize:11,fontWeight:700,letterSpacing:.6,textTransform:"uppercase",color:currentTopic._type==="review"?"var(--amber)":"var(--t3)",display:"block",marginBottom:7}}>
+                {currentTopic._type === "review" ? "🔁 Suas Anotações (edite e complemente)" : "📝 Resumo / Anotações"}
+              </label>
+              {currentTopic._type === "review" && !noteText && (
+                <div style={{marginBottom:8,padding:"8px 12px",borderRadius:6,background:"var(--amber-d)",border:"1px solid rgba(251,191,36,0.3)",fontSize:12,color:"var(--amber)"}}>
+                  Nenhuma anotação anterior. Aproveite para registrar o que relembrou!
+                </div>
+              )}
               <textarea
                 className="inp"
-                style={{minHeight:90,resize:"vertical",fontFamily:"inherit",fontSize:13,lineHeight:1.6}}
+                style={{minHeight:currentTopic._type==="review"?120:90,resize:"vertical",fontFamily:"inherit",fontSize:13,lineHeight:1.6,borderColor:currentTopic._type==="review"?"rgba(251,191,36,0.4)":"var(--b2)"}}
                 value={noteText}
                 onChange={e=>setNoteText(e.target.value)}
-                placeholder="Escreva aqui o que você entendeu, pontos importantes, macetes..."
+                placeholder={currentTopic._type === "review" ? "Complemente suas anotações, adicione o que revisou hoje..." : "Escreva aqui o que você entendeu, pontos importantes, macetes..."}
               />
             </div>
-            <button className="btn-estudar" onClick={handleOk}>✅ Concluído — próximo →</button>
-            <button className="btn-pular" onClick={handlePular}>📅 Pular e reagendar para depois</button>
+            <button className="btn-estudar" onClick={jaEstudada ? handleImportarAula : handleOk}>
+              {jaEstudada
+                ? "📥 Importar Aula Já Estudada"
+                : currentTopic._type === "review" ? "✅ Revisão concluída →" : "✅ Concluído — próximo →"}
+            </button>
+            {currentTopic._type === "lesson" && !jaEstudada && (
+              <button className="btn-pular" onClick={handlePular}>📅 Pular e reagendar para depois</button>
+            )}
           </>
         )}
       </div>
@@ -1833,6 +2530,7 @@ const NAV = {
     { id: "resumos",        label: "Resumos",        icon: "✍️" },
     { id: "simulados",      label: "Simulados",      icon: "📝" },
     { id: "ranking",        label: "Ranking",        icon: "🏆" },
+    { id: "batalha",       label: "Batalha",        icon: "⚔️" },
   ],
   aluno: [
     { id: "dashboard", label: "Dashboard",       icon: "⊞" },
@@ -1841,7 +2539,9 @@ const NAV = {
     { id: "progresso", label: "Progresso",        icon: "📊" },
     { id: "conteudos", label: "Conteúdos",       icon: "📚" },
     { id: "simulados", label: "Simulados",       icon: "📝" },
-    { id: "ranking",   label: "Ranking",          icon: "🏆" },
+    { id: "ranking",         label: "Ranking",          icon: "🏆" },
+    { id: "gerador-prompt",  label: "Gerador de Prompt",icon: "🧠" },
+    { id: "batalha",          label: "Batalha",          icon: "⚔️" },
   ],
 };
 const ROLE_LABEL = { admin: "Administrador", coach: "Coach", aluno: "Aluno" };
@@ -2492,11 +3192,14 @@ function CoachEditais({ user, refresh }) {
 function CoachProgresso({ user }) {
   const alunos = usersModule.getAlunos(user.id);
   const planos = storage.get().planos;
+  const db = storage.get();
   return (
     <div>
       <div className="ph"><div><h1>Progresso dos Alunos</h1></div></div>
       {alunos.length===0?<div className="card"><div className="empty"><h3>Nenhum aluno</h3></div></div>:alunos.map(a=>{
         const ap=planos.filter(p=>p.alunoId===a.id);
+        // Simulados finalizados pelo aluno
+        const tentativasAluno = (db.tentativas||[]).filter(t=>t.alunoId===a.id && t.status==="finalizada");
         return (
           <div className="sec-card mb4" key={a.id}>
             <div className="sec-hd"><div className="fw7 fh" style={{fontSize:15}}>{a.name}</div><span className="badge bb">{a.email}</span></div>
@@ -2517,6 +3220,40 @@ function CoachProgresso({ user }) {
                   </div>
                 );
               })}
+
+              {/* Histórico de Simulados do Aluno */}
+              {tentativasAluno.length > 0 && (
+                <div style={{marginTop:12}}>
+                  <div style={{fontSize:11,fontWeight:700,letterSpacing:1,textTransform:"uppercase",color:"var(--t3)",marginBottom:10}}>📝 Simulados Realizados</div>
+                  <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                    {tentativasAluno.map(tent=>{
+                      const sim = (db.simulados||[]).find(s=>s.id===tent.simuladoId);
+                      const total = (db.questoes||[]).filter(q=>q.simuladoId===tent.simuladoId).length;
+                      const pct = total > 0 ? Math.round((tent.acertos/total)*100) : 0;
+                      const minutos = Math.floor((tent.tempoDecorridoSegundos||0)/60);
+                      const segundos = (tent.tempoDecorridoSegundos||0)%60;
+                      return (
+                        <div key={tent.id} style={{padding:"10px 14px",borderRadius:8,background:"var(--s3)",border:"1px solid var(--b1)",display:"flex",justifyContent:"space-between",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+                          <div>
+                            <div style={{fontSize:13,fontWeight:600,color:"var(--t1)",marginBottom:2}}>{sim?.nome||"Simulado"}</div>
+                            <div style={{fontSize:11,color:"var(--t3)"}}>
+                              {new Date(tent.finishedAt).toLocaleDateString("pt-BR",{day:"2-digit",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit"})}
+                              {tent.tempoDecorridoSegundos ? ` • ⏱️ ${minutos}m ${segundos}s` : ""}
+                            </div>
+                          </div>
+                          <div style={{display:"flex",gap:10,alignItems:"center"}}>
+                            <div style={{textAlign:"center"}}>
+                              <div style={{fontSize:18,fontWeight:900,color:pct>=60?"var(--green)":"var(--red)",fontFamily:"Cabinet Grotesk"}}>{tent.acertos}/{total}</div>
+                              <div style={{fontSize:10,color:"var(--t3)"}}>acertos</div>
+                            </div>
+                            <span className={`badge ${pct>=60?"bg":"br"}`}>{pct}%</span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         );
@@ -2963,9 +3700,46 @@ function CoachPlanoTabela({ aluno, plano, setModalAula }) {
   );
 }
 
+// Constrói mapa topicId → { name, materiaName, materiaColor } a partir do edital
+function buildTopicMap(edital) {
+  const map = {};
+  if (!edital) return map;
+  for (const m of (edital.materias || [])) {
+    for (const t of (m.topicos || [])) {
+      map[t.id] = { name: t.name, materiaName: m.name, materiaColor: m.color };
+    }
+  }
+  return map;
+}
+
 // Componente: Vista em cronograma
 function CoachPlanoCronograma({ aluno, plano, setModalAula }) {
-  const sorted = Object.keys(plano.plan || {}).sort();
+  const edital = editaisModule.getById(plano.editalId);
+  const topicMap = buildTopicMap(edital);
+
+  // Dias do plano atual
+  const planDays = { ...(plano.plan || {}) };
+
+  // Reconstrói dias históricos a partir do progresso (datas que não estão no plano)
+  const todayKey = localDateKey();
+  const prog = storage.get().progresso.filter(
+    p => p.alunoId === aluno.id && p.planoId === plano.id && p.done && !p.key.endsWith("-rev")
+  );
+  prog.forEach(p => {
+    const date = p.key.substring(0, 10);
+    const topicId = p.key.substring(11);
+    if (date >= todayKey) return; // só datas passadas
+    if (!planDays[date]) {
+      planDays[date] = { date, topicos: [], reviews: [], _history: true };
+    }
+    // Adiciona o tópico ao dia histórico se ainda não estiver lá
+    if (!planDays[date].topicos.find(t => t.id === topicId)) {
+      const info = topicMap[topicId] || { name: topicId, materiaName: "", materiaColor: "#6b7280" };
+      planDays[date].topicos.push({ id: topicId, ...info });
+    }
+  });
+
+  const sorted = Object.keys(planDays).sort();
   let weekStart = null;
   const semanas = [];
 
@@ -2981,7 +3755,7 @@ function CoachPlanoCronograma({ aluno, plano, setModalAula }) {
       semanas.push({ start: wKey, end: localDateKey(wEnd), dias: {} });
     }
     const currentWeek = semanas[semanas.length - 1];
-    if (!currentWeek.dias[date]) currentWeek.dias[date] = plano.plan[date];
+    if (!currentWeek.dias[date]) currentWeek.dias[date] = planDays[date];
   });
 
   return (
@@ -3163,6 +3937,26 @@ function AlunoPlano({ user, refresh }) {
   const weekDays=getWeekDays(weekOffset);
   const wLabel=`${new Date(weekDays[0]+"T00:00:00").toLocaleDateString("pt-BR",{day:"2-digit",month:"short"})} – ${new Date(weekDays[6]+"T00:00:00").toLocaleDateString("pt-BR",{day:"2-digit",month:"short"})}`;
 
+  // Mapa topicId → info (para reconstruir histórico de dias não presentes no plano)
+  const _editalForHistory = plano ? editaisModule.getById(plano.editalId) : null;
+  const _topicMapHistory  = buildTopicMap(_editalForHistory);
+  const _todayKey = localDateKey(today);
+  function getDayData(dk) {
+    if (plano?.plan?.[dk]) return plano.plan[dk];
+    // Reconstrói dia histórico a partir do progresso (só datas passadas)
+    if (!plano || dk >= _todayKey) return { topicos: [], reviews: [] };
+    const doneProg = storage.get().progresso.filter(
+      p => p.alunoId === user.id && p.planoId === plano.id && p.done && p.key.startsWith(dk + "-") && !p.key.endsWith("-rev")
+    );
+    if (doneProg.length === 0) return { topicos: [], reviews: [] };
+    const topicos = doneProg.map(p => {
+      const tid = p.key.substring(11);
+      const info = _topicMapHistory[tid] || { name: tid, materiaName: "", materiaColor: "#6b7280" };
+      return { id: tid, ...info };
+    });
+    return { topicos, reviews: [], _history: true };
+  }
+
   if (!plano) return (
     <div>
       <div className="ph"><div><h1>Meu Plano</h1><p>Gere seu plano personalizado</p></div></div>
@@ -3297,7 +4091,8 @@ function AlunoPlano({ user, refresh }) {
         {weekOffset!==0&&<button className="btn btn-ghost btn-sm" onClick={()=>setWeekOffset(0)}>Hoje</button>}
       </div>
       {weekDays.map(dk=>{
-        const d=plano.plan[dk]||{topicos:[],reviews:[]};
+        const d=getDayData(dk);
+        const isHistory=d._history===true;
         const date=new Date(dk+"T00:00:00");
         const isToday=dk===localDateKey(today);
         return (
@@ -3306,8 +4101,9 @@ function AlunoPlano({ user, refresh }) {
               <div><div style={{fontFamily:"Cabinet Grotesk",fontWeight:700,fontSize:14}}>{DAYS_FULL[date.getDay()]}</div><div className="text-xs text-dim">{date.toLocaleDateString("pt-BR")}</div></div>
               {isToday&&<span className="badge bg">Hoje</span>}
             </div>
+            {isHistory&&<div style={{fontSize:10,color:"var(--green)",fontWeight:700,marginBottom:8,letterSpacing:.5}}>✅ CONCLUÍDO</div>}
             {d.topicos.length===0&&d.reviews.length===0&&<p className="text-sm text-muted">Nenhum conteúdo</p>}
-            {d.topicos.length>0&&<div className="mb3">{d.topicos.map((t,i)=>{const key=`${dk}-${t.id}`;const done=progressoModule.isDone(user.id,plano.id,key);const material=getTopicMaterial(t.id);return(<div key={i} className={`topic-row ${done?"done":""}`}><div className="dot-c" style={{background:t.materiaColor}}/><span className="tr-name">{t.name}</span>{(t.materialUrl||material)&&<button onClick={()=>setShowPdfModal(t.id)} className="mat-link" style={{background:"none",border:"none",cursor:"pointer",padding:"0 4px",fontSize:11,color:"var(--blue)"}}>📎</button>}<span className="tr-tag">{t.materiaName}</span><button className={`ck-btn ${done?"ck":""}`} onClick={()=>toggle(key)}>{done&&<CheckIcon/>}</button></div>);})}</div>}
+            {d.topicos.length>0&&<div className="mb3">{d.topicos.map((t,i)=>{const key=`${dk}-${t.id}`;const done=progressoModule.isDone(user.id,plano.id,key)||isHistory;const material=getTopicMaterial(t.id);return(<div key={i} className={`topic-row ${done?"done":""}`}><div className="dot-c" style={{background:t.materiaColor}}/><span className="tr-name">{t.name}</span>{(t.materialUrl||material)&&<button onClick={()=>setShowPdfModal(t.id)} className="mat-link" style={{background:"none",border:"none",cursor:"pointer",padding:"0 4px",fontSize:11,color:"var(--blue)"}}>📎</button>}<span className="tr-tag">{t.materiaName}</span>{!isHistory&&<button className={`ck-btn ${done?"ck":""}`} onClick={()=>toggle(key)}>{done&&<CheckIcon/>}</button>}{isHistory&&<CheckIcon/>}</div>);})}</div>}
             {isToday&&allTodayDone&&<button className="adiantar-btn" onClick={()=>setShowAdiantar(true)}>⚡ Adiantar aulas de amanhã</button>}
             {d.reviews.length>0&&<div className="rev-sec"><div className="rev-lbl">Revisões</div>{d.reviews.map((r,i)=>{const key=`${dk}-${r.id}-rev`;const done=progressoModule.isDone(user.id,plano.id,key);const nota=progressoModule.getNote(user.id,plano.id,r.id);const isOpen=expandedNote===`${dk}-${r.id}`;return(<div key={i}><div className={`topic-row ${done?"done":""}`}><div className="dot-c" style={{background:r.materiaColor}}/><span className="tr-name">{r.name}</span><span className="tr-tag">🕐 {r.reviewInterval}d</span>{nota&&<button onClick={()=>setExpandedNote(isOpen?null:`${dk}-${r.id}`)} style={{background:"none",border:"none",cursor:"pointer",fontSize:12,color:isOpen?"var(--amber)":"var(--t3)",padding:"0 4px",flexShrink:0}} title="Ver anotações">📝</button>}<button className={`ck-btn ${done?"ck":""}`} onClick={()=>toggle(key)}>{done&&<CheckIcon/>}</button></div>{isOpen&&nota&&<div style={{margin:"6px 0 8px 24px",padding:"10px 13px",background:"var(--s2)",borderRadius:9,borderLeft:"3px solid var(--amber)",fontSize:12,color:"var(--t2)",lineHeight:1.6,whiteSpace:"pre-wrap"}}>{nota}</div>}</div>);})}</div>}
           </div>
@@ -3331,6 +4127,8 @@ function AlunoRotina({ user, refresh }) {
   }
   const [diasConfig, setDiasConfig] = useState(initDiasConfig);
   const [maxRevisoes, setMaxRevisoes] = useState(plano?.rotina?.maxRevisoesPorDia || 5);
+  const [minRevisoes, setMinRevisoes] = useState(plano?.rotina?.minRevisoesPorDia || 0);
+  const [modoOrganizacao, setModoOrganizacao] = useState(plano?.rotina?.modoOrganizacao || "alternado");
   const [saved, setSaved] = useState(false);
   const [ltick, setLtick] = useState(0);
   const logs = logModule.getByUser(user.id);
@@ -3342,7 +4140,7 @@ function AlunoRotina({ user, refresh }) {
   const aulasSem = Object.values(diasConfig).reduce((a,n) => a+n, 0);
   function handleSave() {
     if (!plano || aulasSem===0) return;
-    planosModule.updateRotina(plano.id, user.id, { diasConfig, maxRevisoesPorDia: maxRevisoes });
+    planosModule.updateRotina(plano.id, user.id, { diasConfig, maxRevisoesPorDia: maxRevisoes, minRevisoesPorDia: minRevisoes, modoOrganizacao });
     refresh(); setLtick(t=>t+1); setSaved(true);
     setTimeout(()=>setSaved(false), 2500);
   }
@@ -3376,12 +4174,41 @@ function AlunoRotina({ user, refresh }) {
           </div>
           <div style={{fontSize:12,color:"var(--t3)",marginBottom:12}}>{aulasSem} aula{aulasSem!==1?"s":""}/semana</div>
           <div style={{padding:"14px 16px",borderRadius:10,background:"var(--s2)",border:"1px solid var(--b1)",marginBottom:14}}>
-            <div style={{fontSize:12,fontWeight:700,color:"var(--t2)",marginBottom:10}}>🔁 Máx. revisões por dia</div>
-            <div style={{display:"flex",alignItems:"center",gap:10}}>
-              <button onClick={()=>{setMaxRevisoes(r=>Math.max(1,r-1));setSaved(false);}} style={{width:30,height:30,borderRadius:7,border:"1.5px solid var(--b2)",background:"var(--s3)",cursor:"pointer",fontSize:16,fontWeight:700,color:"var(--t2)",display:"flex",alignItems:"center",justifyContent:"center"}}>−</button>
-              <span style={{fontFamily:"Cabinet Grotesk",fontWeight:900,fontSize:20,color:"var(--amber)",minWidth:32,textAlign:"center"}}>{maxRevisoes}</span>
-              <button onClick={()=>{setMaxRevisoes(r=>Math.min(20,r+1));setSaved(false);}} style={{width:30,height:30,borderRadius:7,border:"1.5px solid var(--b2)",background:"var(--s3)",cursor:"pointer",fontSize:16,fontWeight:700,color:"var(--t2)",display:"flex",alignItems:"center",justifyContent:"center"}}>+</button>
-              <span style={{fontSize:11,color:"var(--t3)",marginLeft:4}}>revisões/dia — excedente vai pro próximo dia</span>
+            <div style={{fontSize:12,fontWeight:700,color:"var(--t2)",marginBottom:12}}>📚 Organização das matérias</div>
+            <div style={{display:"flex",flexDirection:"column",gap:8}}>
+              <label style={{display:"flex",alignItems:"flex-start",gap:10,padding:"10px 12px",borderRadius:8,border:`1.5px solid ${modoOrganizacao==="alternado"?"var(--green)":"var(--b2)"}`,background:modoOrganizacao==="alternado"?"rgba(34,211,165,0.07)":"transparent",cursor:"pointer"}} onClick={()=>{setModoOrganizacao("alternado");setSaved(false);}}>
+                <input type="radio" checked={modoOrganizacao==="alternado"} onChange={()=>{setModoOrganizacao("alternado");setSaved(false);}} style={{marginTop:2,accentColor:"var(--green)"}}/>
+                <div>
+                  <div style={{fontSize:13,fontWeight:700,color:"var(--t1)"}}>🔀 Matérias alternadas</div>
+                  <div style={{fontSize:11,color:"var(--t3)",marginTop:2}}>Disciplinas intercaladas — mais variedade e retenção</div>
+                </div>
+              </label>
+              <label style={{display:"flex",alignItems:"flex-start",gap:10,padding:"10px 12px",borderRadius:8,border:`1.5px solid ${modoOrganizacao==="sequencial"?"var(--blue)":"var(--b2)"}`,background:modoOrganizacao==="sequencial"?"rgba(96,165,250,0.07)":"transparent",cursor:"pointer"}} onClick={()=>{setModoOrganizacao("sequencial");setSaved(false);}}>
+                <input type="radio" checked={modoOrganizacao==="sequencial"} onChange={()=>{setModoOrganizacao("sequencial");setSaved(false);}} style={{marginTop:2,accentColor:"var(--blue)"}}/>
+                <div>
+                  <div style={{fontSize:13,fontWeight:700,color:"var(--t1)"}}>📖 Matérias sequenciais</div>
+                  <div style={{fontSize:11,color:"var(--t3)",marginTop:2}}>Cada disciplina em bloco antes de ir para a próxima</div>
+                </div>
+              </label>
+            </div>
+          </div>
+                    <div style={{padding:"14px 16px",borderRadius:10,background:"var(--s2)",border:"1px solid var(--b1)",marginBottom:14}}>
+            <div style={{fontSize:12,fontWeight:700,color:"var(--t2)",marginBottom:12}}>🔁 Revisões por dia</div>
+            <div style={{display:"flex",flexDirection:"column",gap:10}}>
+              <div style={{display:"flex",alignItems:"center",gap:10}}>
+                <span style={{fontSize:11,color:"var(--t3)",width:50}}>Mínimo</span>
+                <button onClick={()=>{setMinRevisoes(r=>Math.max(0,r-1));setSaved(false);}} style={{width:28,height:28,borderRadius:7,border:"1.5px solid var(--b2)",background:"var(--s3)",cursor:"pointer",fontSize:15,fontWeight:700,color:"var(--t2)",display:"flex",alignItems:"center",justifyContent:"center"}}>−</button>
+                <span style={{fontFamily:"Cabinet Grotesk",fontWeight:900,fontSize:18,color:"var(--blue)",minWidth:28,textAlign:"center"}}>{minRevisoes === 0 ? "—" : minRevisoes}</span>
+                <button onClick={()=>{setMinRevisoes(r=>Math.min(maxRevisoes,r+1));setSaved(false);}} style={{width:28,height:28,borderRadius:7,border:"1.5px solid var(--b2)",background:"var(--s3)",cursor:"pointer",fontSize:15,fontWeight:700,color:"var(--t2)",display:"flex",alignItems:"center",justifyContent:"center"}}>+</button>
+                <span style={{fontSize:11,color:"var(--t3)"}}>puxar adiantadas p/ completar</span>
+              </div>
+              <div style={{display:"flex",alignItems:"center",gap:10}}>
+                <span style={{fontSize:11,color:"var(--t3)",width:50}}>Máximo</span>
+                <button onClick={()=>{setMaxRevisoes(r=>{const v=Math.max(1,r-1);if(minRevisoes>v)setMinRevisoes(v);return v;});setSaved(false);}} style={{width:28,height:28,borderRadius:7,border:"1.5px solid var(--b2)",background:"var(--s3)",cursor:"pointer",fontSize:15,fontWeight:700,color:"var(--t2)",display:"flex",alignItems:"center",justifyContent:"center"}}>−</button>
+                <span style={{fontFamily:"Cabinet Grotesk",fontWeight:900,fontSize:18,color:"var(--amber)",minWidth:28,textAlign:"center"}}>{maxRevisoes}</span>
+                <button onClick={()=>{setMaxRevisoes(r=>Math.min(20,r+1));setSaved(false);}} style={{width:28,height:28,borderRadius:7,border:"1.5px solid var(--b2)",background:"var(--s3)",cursor:"pointer",fontSize:15,fontWeight:700,color:"var(--t2)",display:"flex",alignItems:"center",justifyContent:"center"}}>+</button>
+                <span style={{fontSize:11,color:"var(--t3)"}}>excedente vai pro próximo dia</span>
+              </div>
             </div>
           </div>
           {saved&&<div className="alert alert-green mb3">✓ Rotina atualizada! Plano regenerado.</div>}
@@ -3639,12 +4466,14 @@ function AdminDebug() {
   function statsUpTo(key) {
     if (!plano) return null;
     const prog = storage.get().progresso.filter(p => p.alunoId === selectedAluno && p.planoId === plano.id && p.done);
-    const totalAulas = Object.values(plano.plan).reduce((a,d) => a+d.topicos.length, 0);
-    const aulasFeitas = prog.filter(p => {
-      const dk = p.key.split("-").slice(0,3).join("-");
-      return dk <= key && !p.key.endsWith("-rev");
-    }).length;
-    const pct = totalAulas ? Math.round((aulasFeitas/totalAulas)*100) : 0;
+    const doneIds = new Set(
+      prog.filter(p => { const dk = p.key.split("-").slice(0,3).join("-"); return dk <= key && !p.key.endsWith("-rev"); })
+          .map(p => p.key.substring(11))
+    );
+    const aulasFeitas = doneIds.size;
+    const notDoneInPlan = Object.values(plano.plan).flatMap(d => d.topicos).filter(t => !doneIds.has(t.id)).length;
+    const totalAulas = aulasFeitas + notDoneInPlan;
+    const pct = totalAulas ? Math.min(100, Math.round((aulasFeitas/totalAulas)*100)) : 0;
     return { totalAulas, aulasFeitas, pct };
   }
 
@@ -3798,13 +4627,77 @@ function AlunoSimulados({ user, refresh }) {
   const editais = editaisModule.getByAluno(user.id);
   const [editalId, setEditalId] = useState(editais[0]?.id || "");
   const [resolvendo, setResolvendo] = useState(null);
+  const [verFeedback, setVerFeedback] = useState(null); // tentativaId
+  const [abaAtiva, setAbaAtiva] = useState("simulados"); // "simulados" | "revisoes"
 
   const edital = editaisModule.getById(editalId);
-  const simulados = edital ? simuladosModule.getByEdital(editalId) : [];
+  const simulados = edital ? simuladosModule.getByEditalParaAluno(editalId, user.id) : [];
+  const todasRevisoes = feedbackModule.getByAluno(user.id);
 
   return (
     <div>
-      <div className="ph"><div><h1>📝 Simulados</h1><p>Resolva simulados e pratique</p></div></div>
+      <div className="ph"><div><h1>📝 Simulados</h1><p>Resolva simulados e acompanhe suas revisões</p></div></div>
+
+      {/* Abas */}
+      <div style={{ display:"flex", gap:8, marginBottom:24, borderBottom:"1px solid var(--b2)", paddingBottom:12 }}>
+        {[
+          { id:"simulados", label:"📝 Simulados", count: null },
+          { id:"revisoes",  label:"📘 Revisão do Professor", count: todasRevisoes.length },
+        ].map(ab => (
+          <button key={ab.id} onClick={()=>setAbaAtiva(ab.id)} style={{ padding:"8px 18px", borderRadius:8, border:"none", background:abaAtiva===ab.id?"var(--green)":"var(--s2)", color:abaAtiva===ab.id?"#07080f":"var(--t2)", fontSize:13, fontWeight:700, cursor:"pointer", display:"flex", alignItems:"center", gap:6 }}>
+            {ab.label}
+            {ab.count > 0 && <span style={{ background:abaAtiva===ab.id?"rgba(0,0,0,0.2)":"var(--green-d)", color:abaAtiva===ab.id?"#07080f":"var(--green)", borderRadius:10, padding:"1px 7px", fontSize:11, fontWeight:900 }}>{ab.count}</span>}
+          </button>
+        ))}
+      </div>
+
+      {/* Aba Revisão do Professor */}
+      {abaAtiva === "revisoes" && (
+        <div>
+          {todasRevisoes.length === 0 ? (
+            <div className="card"><div className="empty"><h3>Nenhuma revisão recebida ainda</h3><p style={{color:"var(--t3)"}}>Quando seu professor corrigir um simulado e enviar o relatório, ele aparecerá aqui.</p></div></div>
+          ) : (
+            <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
+              {todasRevisoes.map(fb => {
+                const tentativa = tentativasModule.getById(fb.tentativaId);
+                const simulado = tentativa ? simuladosModule.getById(tentativa.simuladoId) : null;
+                const questoes = tentativa ? questoesModule.getBySimulado(tentativa.simuladoId) : [];
+                const total = questoes.length;
+                const pct = total > 0 ? Math.round(((tentativa?.acertos||0) / total) * 100) : 0;
+                const coach = usersModule.getById(fb.coachId);
+                const comComentarios = (fb.comentariosQuestoes||[]).filter(c => c.comentario).length;
+                return (
+                  <div key={fb.id} style={{ padding:18, borderRadius:12, background:"var(--s2)", border:"1.5px solid rgba(34,211,165,0.35)" }}>
+                    <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:12 }}>
+                      <div>
+                        <div style={{ fontSize:15, fontWeight:900, fontFamily:"Cabinet Grotesk", marginBottom:3 }}>{simulado?.nome || "Simulado"}</div>
+                        <div style={{ fontSize:12, color:"var(--t3)" }}>
+                          Corrigido por <strong>{coach?.name||"Professor"}</strong> · {new Date(fb.enviadoEm).toLocaleDateString("pt-BR",{day:"2-digit",month:"short",year:"numeric"})}
+                        </div>
+                      </div>
+                      <div style={{ textAlign:"right" }}>
+                        <div style={{ fontSize:22, fontWeight:900, fontFamily:"Cabinet Grotesk", color:pct>=60?"var(--green)":"var(--red)" }}>{pct}%</div>
+                        <div style={{ fontSize:11, color:"var(--t3)" }}>{tentativa?.acertos||0}/{total} acertos</div>
+                      </div>
+                    </div>
+                    <div style={{ display:"flex", gap:8, marginBottom:12, flexWrap:"wrap" }}>
+                      {comComentarios > 0 && <span style={{ fontSize:11, padding:"3px 10px", borderRadius:10, background:"var(--blue-d)", color:"var(--blue)", fontWeight:700 }}>💬 {comComentarios} comentário{comComentarios!==1?"s":""}</span>}
+                      {fb.orientacoesGerais && <span style={{ fontSize:11, padding:"3px 10px", borderRadius:10, background:"var(--amber-d,rgba(251,191,36,.1))", color:"var(--amber)", fontWeight:700 }}>📋 Orientações gerais</span>}
+                    </div>
+                    <button onClick={()=>setVerFeedback(fb.tentativaId)} style={{ width:"100%", padding:"10px", borderRadius:8, border:"none", background:"var(--green)", color:"#07080f", fontSize:13, fontWeight:900, cursor:"pointer", fontFamily:"Cabinet Grotesk" }}>
+                      📘 Ver Revisão Completa
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Aba Simulados */}
+      {abaAtiva === "simulados" && (
+      <div>
 
       {editais.length > 1 && (
         <div style={{ marginBottom: 24 }}>
@@ -3843,6 +4736,8 @@ function AlunoSimulados({ user, refresh }) {
             const tentativas = tentativasModule.getBySimuladoAluno(sim.id, user.id);
             const finalizadas = tentativas.filter(t => t.status === "finalizada");
             const emAndamento = tentativas.find(t => t.status === "em_andamento");
+            // Verifica se alguma tentativa tem feedback enviado
+            const tentativaComFeedback = finalizadas.find(t => feedbackModule.getEnviadoParaAluno(t.id));
 
             return (
               <div
@@ -3851,23 +4746,26 @@ function AlunoSimulados({ user, refresh }) {
                   padding: 16,
                   borderRadius: 8,
                   background: "var(--s2)",
-                  border: "1px solid var(--b2)",
+                  border: tentativaComFeedback ? "1px solid rgba(34,211,165,0.35)" : "1px solid var(--b2)",
                   display: "flex",
                   flexDirection: "column",
                   gap: 12
                 }}
               >
                 <div>
-                  <div style={{ fontSize: 14, fontWeight: 700, color: "var(--t1)", marginBottom: 4 }}>
-                    {sim.nome}
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: "var(--t1)" }}>{sim.nome}</div>
+                    {tentativaComFeedback && (
+                      <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 10, background: "var(--green-d)", color: "var(--green)", border: "1px solid rgba(34,211,165,0.3)" }}>
+                        📨 Feedback disponível
+                      </span>
+                    )}
                   </div>
-                  <div style={{ fontSize: 11, color: "var(--t3)", marginBottom: 8 }}>
+                  <div style={{ fontSize: 11, color: "var(--t3)", marginBottom: 6 }}>
                     {sim.tipo === "geral" ? "Simulado Geral" : "Simulado Específico"}
                   </div>
                   {sim.descricao && (
-                    <div style={{ fontSize: 12, color: "var(--t2)", marginBottom: 8 }}>
-                      {sim.descricao}
-                    </div>
+                    <div style={{ fontSize: 12, color: "var(--t2)", marginBottom: 6 }}>{sim.descricao}</div>
                   )}
                 </div>
 
@@ -3880,20 +4778,26 @@ function AlunoSimulados({ user, refresh }) {
                   )}
                 </div>
 
-                <div style={{ display: "flex", gap: 8, marginTop: "auto" }}>
+                <div style={{ display: "flex", gap: 8, marginTop: "auto", flexWrap: "wrap" }}>
+                  {tentativaComFeedback && (
+                    <button
+                      onClick={() => setVerFeedback(tentativaComFeedback.id)}
+                      style={{
+                        flex: 1, minWidth: 120,
+                        padding: "8px 12px", borderRadius: 6, border: "none",
+                        background: "var(--green)", color: "#07080f",
+                        fontSize: 12, fontWeight: 700, cursor: "pointer"
+                      }}
+                    >
+                      📨 Ver Feedback
+                    </button>
+                  )}
                   {emAndamento ? (
                     <button
                       onClick={() => setResolvendo(emAndamento.id)}
                       style={{
-                        flex: 1,
-                        padding: "8px 12px",
-                        borderRadius: 6,
-                        border: "none",
-                        background: "var(--amber)",
-                        color: "white",
-                        fontSize: 12,
-                        fontWeight: 600,
-                        cursor: "pointer"
+                        flex: 1, padding: "8px 12px", borderRadius: 6, border: "none",
+                        background: "var(--amber)", color: "white", fontSize: 12, fontWeight: 600, cursor: "pointer"
                       }}
                     >
                       Continuar
@@ -3905,18 +4809,11 @@ function AlunoSimulados({ user, refresh }) {
                         setResolvendo(nova.id);
                       }}
                       style={{
-                        flex: 1,
-                        padding: "8px 12px",
-                        borderRadius: 6,
-                        border: "none",
-                        background: "var(--blue)",
-                        color: "white",
-                        fontSize: 12,
-                        fontWeight: 600,
-                        cursor: "pointer"
+                        flex: 1, padding: "8px 12px", borderRadius: 6, border: "none",
+                        background: "var(--blue)", color: "white", fontSize: 12, fontWeight: 600, cursor: "pointer"
                       }}
                     >
-                      Resolver
+                      {finalizadas.length > 0 ? "Resolver novamente" : "Resolver"}
                     </button>
                   )}
                 </div>
@@ -3926,8 +4823,13 @@ function AlunoSimulados({ user, refresh }) {
         </div>
       )}
 
+      </div>)}
+
       {resolvendo && (
         <ResolverSimulado tentativaId={resolvendo} onVoltar={() => { setResolvendo(null); refresh?.(); }} />
+      )}
+      {verFeedback && (
+        <ModalVerFeedback tentativaId={verFeedback} onClose={() => setVerFeedback(null)} />
       )}
     </div>
   );
@@ -4007,11 +4909,11 @@ function ResolverSimulado({ tentativaId, onVoltar }) {
     <div style={{
       position: "fixed", top: 0, left: 0, right: 0, bottom: 0,
       background: "rgba(0,0,0,0.8)", display: "flex", alignItems: "center", justifyContent: "center",
-      zIndex: 1000, overflowY: "auto"
+      zIndex: 1000, padding: "20px 12px"
     }}>
       <div style={{
-        background: "var(--s1)", padding: 24, borderRadius: 12, maxWidth: 600, width: "90%",
-        margin: "20px auto"
+        background: "var(--s1)", borderRadius: 12, maxWidth: 600, width: "90%",
+        display: "flex", flexDirection: "column", maxHeight: "90vh", overflow: "hidden"
       }} onClick={(e) => e.stopPropagation()}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
           <div style={{ fontSize: 12, color: "var(--t3)" }}>
@@ -4119,25 +5021,25 @@ function ResolverSimulado({ tentativaId, onVoltar }) {
           )}
         </div>
 
-        <button
-          onClick={() => {
-            tentativasModule.salvarTempoDecorrido(tentativaId, tempoDecorridoSegundos);
-            onVoltar();
-          }}
-          style={{
-            width: "100%",
-            padding: "10px 12px",
-            borderRadius: 6,
-            border: "1px solid var(--b2)",
-            background: "transparent",
-            color: "var(--t2)",
-            fontSize: 13,
-            fontWeight: 600,
-            cursor: "pointer"
-          }}
-        >
-          Sair e salvar progresso
-        </button>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <button
+            onClick={() => { setQuestaoAtual(questaoAtual + 1); }}
+            style={{ flex: 1, padding: "10px 12px", borderRadius: 6, border: "1px solid var(--b2)", background: "transparent", color: "var(--t3)", fontSize: 13, fontWeight: 600, cursor: "pointer" }}
+          >
+            Deixar em branco
+          </button>
+          <button
+            onClick={() => {
+              if (window.confirm("Finalizar o simulado agora? As questoes nao respondidas contarao como em branco.")) {
+                tentativasModule.finalizar(tentativaId, tempoDecorridoSegundos);
+                onVoltar();
+              }
+            }}
+            style={{ flex: 1, padding: "10px 12px", borderRadius: 6, border: "none", background: "var(--blue)", color: "white", fontSize: 13, fontWeight: 700, cursor: "pointer" }}
+          >
+            Finalizar agora
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -5051,6 +5953,7 @@ function CoachSimulados({ user, refresh }) {
   const [editalId, setEditalId] = useState(editais[0]?.id || "");
   const [criando, setCriando] = useState(false);
   const [selecionado, setSelecionado] = useState(null);
+  const alunos = usersModule.getAlunos(user.id);
 
   const edital = editaisModule.getById(editalId);
   const simulados = edital ? simuladosModule.getByEdital(editalId) : [];
@@ -5183,6 +6086,7 @@ function CoachSimulados({ user, refresh }) {
         <ModalCriarSimulado
           editalId={editalId}
           coachId={user.id}
+          alunos={alunos}
           onClose={() => { setCriando(false); refresh?.(); }}
         />
       )}
@@ -5199,7 +6103,7 @@ function CoachSimulados({ user, refresh }) {
 }
 
 // Modal para criar simulado
-function ModalCriarSimulado({ editalId, coachId, onClose }) {
+function ModalCriarSimulado({ editalId, coachId, alunos, onClose }) {
   const edital = editaisModule.getById(editalId);
   const [nome, setNome] = useState("");
   const [tipo, setTipo] = useState("geral");
@@ -5209,6 +6113,12 @@ function ModalCriarSimulado({ editalId, coachId, onClose }) {
   const [temTextoMotivador, setTemTextoMotivador] = useState(false);
   const [textoMotivador, setTextoMotivador] = useState("");
   const [numQuestoes, setNumQuestoes] = useState(1);
+  const [destinatario, setDestinatario] = useState("todos"); // "todos" | "especificos"
+  const [alunosSelecionados, setAlunosSelecionados] = useState([]);
+
+  function toggleAluno(id) {
+    setAlunosSelecionados(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+  }
 
   const materia = edital?.materias?.find(m => m.id === materiaId);
   const ehLinguaPortuguesa = materia?.name?.includes("Língua Portuguesa") || materia?.name?.includes("Português");
@@ -5417,10 +6327,48 @@ function ModalCriarSimulado({ editalId, coachId, onClose }) {
           </div>
         </div>
 
+        <div style={{ marginBottom: 20 }}>
+          <label style={{ display: "block", fontSize: 12, fontWeight: 600, marginBottom: 8, color: "var(--t2)" }}>
+            Quem pode responder este simulado?
+          </label>
+          <div style={{ display: "flex", gap: 16, marginBottom: 10 }}>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+              <input type="radio" checked={destinatario === "todos"} onChange={() => { setDestinatario("todos"); setAlunosSelecionados([]); }} />
+              <span style={{ fontSize: 13, color: "var(--t1)" }}>Todos os alunos</span>
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+              <input type="radio" checked={destinatario === "especificos"} onChange={() => setDestinatario("especificos")} />
+              <span style={{ fontSize: 13, color: "var(--t1)" }}>Alunos específicos</span>
+            </label>
+          </div>
+          {destinatario === "especificos" && (
+            <div style={{ maxHeight: 160, overflowY: "auto", border: "1px solid var(--b2)", borderRadius: 8, padding: "8px 12px", background: "var(--s2)", display: "flex", flexDirection: "column", gap: 6 }}>
+              {(!alunos || alunos.length === 0) ? (
+                <div style={{ fontSize: 12, color: "var(--t3)", padding: "8px 0" }}>Nenhum aluno cadastrado</div>
+              ) : alunos.map(a => (
+                <label key={a.id} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", padding: "4px 0" }}>
+                  <input
+                    type="checkbox"
+                    checked={alunosSelecionados.includes(a.id)}
+                    onChange={() => toggleAluno(a.id)}
+                  />
+                  <span style={{ fontSize: 13, color: "var(--t1)" }}>{a.name}</span>
+                </label>
+              ))}
+            </div>
+          )}
+          {destinatario === "especificos" && alunosSelecionados.length > 0 && (
+            <div style={{ fontSize: 11, color: "var(--green)", marginTop: 6 }}>
+              {alunosSelecionados.length} aluno{alunosSelecionados.length > 1 ? "s" : ""} selecionado{alunosSelecionados.length > 1 ? "s" : ""}
+            </div>
+          )}
+        </div>
+
         <div style={{ display: "flex", gap: 12 }}>
           <button
             onClick={() => {
-              const sim = simuladosModule.create(coachId, editalId, nome, tipo, materiaId, descricao);
+              const permitidos = destinatario === "especificos" && alunosSelecionados.length > 0 ? alunosSelecionados : null;
+              const sim = simuladosModule.create(coachId, editalId, nome, tipo, materiaId, descricao, permitidos);
               const updates = {};
               if (tempoLimite) {
                 updates.tempoLimiteMinutos = parseInt(tempoLimite);
@@ -5480,23 +6428,32 @@ function ModalGerenciarSimulado({ simuladoId, coachId, onClose }) {
   const simulado = simuladosModule.getById(simuladoId);
   const questoes = questoesModule.getBySimulado(simuladoId);
   const [adicionandoQuestao, setAdicionandoQuestao] = useState(false);
-  const [tab, setTab] = useState("questoes"); // "questoes" ou "resultados"
+  const [tab, setTab] = useState("questoes"); // "questoes" | "resultados"
+  const [feedbackTentativaId, setFeedbackTentativaId] = useState(null);
+  const [relatorioTentativaId, setRelatorioTentativaId] = useState(null);
+  const [tick, setTick] = useState(0);
+  const [questaoIdx, setQuestaoIdx] = useState(0);
   const tentativas = (storage.get().tentativas || []).filter(t => t.simuladoId === simuladoId && t.status === "finalizada");
   const alunos = usersModule.getAlunos(coachId);
 
   if (!simulado) return null;
 
+  const qi = Math.min(questaoIdx, Math.max(0, questoes.length - 1));
+  const questaoAtual = questoes[qi] || null;
+
   return (
     <div style={{
       position: "fixed", top: 0, left: 0, right: 0, bottom: 0,
       background: "rgba(0,0,0,0.8)", display: "flex", alignItems: "center", justifyContent: "center",
-      zIndex: 1000, overflowY: "auto"
+      zIndex: 1000, padding: "20px 12px"
     }}>
       <div style={{
-        background: "var(--s1)", padding: 24, borderRadius: 12, maxWidth: 600, width: "90%",
-        margin: "20px auto"
+        background: "var(--s1)", borderRadius: 12, maxWidth: 600, width: "90%",
+        display: "flex", flexDirection: "column", maxHeight: "90vh", overflow: "hidden"
       }} onClick={(e) => e.stopPropagation()}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 20 }}>
+        {/* Header fixo */}
+        <div style={{ padding: "20px 24px 0", flexShrink: 0 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 }}>
           <div>
             <div style={{ fontSize: 18, fontWeight: 700, color: "var(--t1)" }}>
               {simulado.nome}
@@ -5521,7 +6478,7 @@ function ModalGerenciarSimulado({ simuladoId, coachId, onClose }) {
           </button>
         </div>
 
-        <div style={{ display: "flex", gap: 12, marginBottom: 20, borderBottom: "1px solid var(--b2)", paddingBottom: 12 }}>
+        <div style={{ display: "flex", gap: 12, marginBottom: 0, borderBottom: "1px solid var(--b2)", paddingBottom: 12 }}>
           <button
             onClick={() => setTab("questoes")}
             style={{
@@ -5553,84 +6510,87 @@ function ModalGerenciarSimulado({ simuladoId, coachId, onClose }) {
             📊 Resultados ({tentativas.length})
           </button>
         </div>
+        </div>{/* fim header fixo */}
+
+        {/* Corpo com scroll */}
+        <div style={{ overflowY: "auto", flex: 1, padding: "16px 24px 24px" }}>
 
         {tab === "questoes" && (
-          <div style={{ marginBottom: 20 }}>
-            <button
-              onClick={() => setAdicionandoQuestao(true)}
-              style={{
-                padding: "8px 16px",
-                borderRadius: 6,
-                border: "none",
-                background: "var(--green)",
-                color: "white",
-                fontSize: 12,
-                fontWeight: 600,
-                cursor: "pointer"
-              }}
-            >
-              + Adicionar Questão
-            </button>
-          </div>
-        )}
+          <div>
+            {/* Botão adicionar */}
+            <div style={{ marginBottom: 14 }}>
+              <button
+                onClick={() => setAdicionandoQuestao(true)}
+                style={{ padding: "8px 16px", borderRadius: 6, border: "none", background: "var(--green)", color: "white", fontSize: 12, fontWeight: 600, cursor: "pointer" }}
+              >
+                + Adicionar Questão
+              </button>
+            </div>
 
-        {tab === "questoes" && (
-          <>
             {questoes.length === 0 ? (
               <div style={{ padding: 16, borderRadius: 8, background: "var(--s2)", color: "var(--t3)", textAlign: "center" }}>
-                Nenhuma questão adicionada ainda
+                Nenhuma questao adicionada ainda
               </div>
             ) : (
-              <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-                {questoes.map((q, i) => (
-                  <div
-                    key={q.id}
-                    style={{
-                      padding: 12,
-                      borderRadius: 8,
-                      background: "var(--s2)",
-                      border: "1px solid var(--b2)"
-                    }}
-                  >
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12 }}>
-                      <div style={{ flex: 1 }}>
-                        <div style={{ fontSize: 12, color: "var(--t3)", marginBottom: 6 }}>
-                          Questão {i + 1}
-                        </div>
-                        <div style={{ fontSize: 13, color: "var(--t1)", marginBottom: 6 }}>
-                          {q.enunciado}
-                        </div>
-                        {q.tipo === "multipla" && (
-                          <div style={{ fontSize: 11, color: "var(--t3)" }}>
-                            {q.alternativas.map((alt, idx) => (
-                              <div key={idx}>{String.fromCharCode(65 + idx)}. {alt}</div>
-                            ))}
-                          </div>
-                        )}
+              <div>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+                  <button
+                    onClick={() => setQuestaoIdx(prev => Math.max(0, prev - 1))}
+                    disabled={qi === 0}
+                    style={{ padding: "6px 14px", borderRadius: 6, border: "none", background: qi === 0 ? "var(--s3)" : "var(--b2)", color: qi === 0 ? "var(--t3)" : "var(--t1)", fontSize: 13, fontWeight: 700, cursor: qi === 0 ? "default" : "pointer" }}
+                  >Anterior</button>
+                  <span style={{ fontSize: 13, fontWeight: 700, color: "var(--t2)" }}>
+                    Questao {qi + 1} de {questoes.length}
+                  </span>
+                  <button
+                    onClick={() => setQuestaoIdx(prev => Math.min(questoes.length - 1, prev + 1))}
+                    disabled={qi === questoes.length - 1}
+                    style={{ padding: "6px 14px", borderRadius: 6, border: "none", background: qi === questoes.length - 1 ? "var(--s3)" : "var(--b2)", color: qi === questoes.length - 1 ? "var(--t3)" : "var(--t1)", fontSize: 13, fontWeight: 700, cursor: qi === questoes.length - 1 ? "default" : "pointer" }}
+                  >Proxima</button>
+                </div>
+                {questaoAtual && (
+                  <div style={{ padding: 16, borderRadius: 10, background: "var(--s2)", border: "1px solid var(--b2)" }}>
+                    <div style={{ fontSize: 11, color: "var(--t3)", fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>
+                      {questaoAtual.tipo === "ce" ? "Certo ou Errado" : "Multipla Escolha"}
+                    </div>
+                    <div style={{ fontSize: 14, color: "var(--t1)", lineHeight: 1.6, marginBottom: 12 }}>
+                      {questaoAtual.enunciado}
+                    </div>
+                    {questaoAtual.tipo === "multipla" && (
+                      <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 12 }}>
+                        {(questaoAtual.alternativas || []).map((alt, idx) => {
+                          const letra = String.fromCharCode(65 + idx);
+                          const isGab = letra === questaoAtual.gabarito;
+                          return (
+                            <div key={idx} style={{ padding: "7px 12px", borderRadius: 7, background: isGab ? "var(--green-d)" : "var(--s3)", border: isGab ? "1px solid var(--green)" : "1px solid transparent", fontSize: 13, color: isGab ? "var(--green)" : "var(--t2)", display: "flex", gap: 8, alignItems: "center" }}>
+                              <span style={{ fontWeight: 700, minWidth: 20 }}>{letra}.</span>
+                              <span style={{ flex: 1 }}>{alt}</span>
+                              {isGab && <span style={{ fontSize: 10, fontWeight: 700 }}>Gabarito</span>}
+                            </div>
+                          );
+                        })}
                       </div>
+                    )}
+                    {questaoAtual.tipo === "ce" && (
+                      <div style={{ display: "flex", gap: 10, marginBottom: 12 }}>
+                        {["C","E"].map(op => (
+                          <div key={op} style={{ padding: "7px 18px", borderRadius: 7, background: op === questaoAtual.gabarito ? "var(--green-d)" : "var(--s3)", border: op === questaoAtual.gabarito ? "1px solid var(--green)" : "1px solid transparent", fontSize: 13, fontWeight: 700, color: op === questaoAtual.gabarito ? "var(--green)" : "var(--t2)" }}>
+                            {op === "C" ? "Certo" : "Errado"}{op === questaoAtual.gabarito ? " (gabarito)" : ""}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 8 }}>
                       <button
-                        onClick={() => {
-                          questoesModule.delete(q.id);
-                          onClose();
-                        }}
-                        style={{
-                          padding: "6px 10px",
-                          borderRadius: 6,
-                          border: "none",
-                          background: "var(--red)",
-                          color: "white",
-                          fontSize: 11,
-                          cursor: "pointer"
-                        }}
-                      >
-                        Deletar
-                      </button>
+                        onClick={() => { if (window.confirm("Deletar?")) { questoesModule.delete(questaoAtual.id); setQuestaoIdx(prev => Math.max(0, prev - 1)); setTick(t=>t+1); } }}
+                        style={{ padding: "6px 12px", borderRadius: 6, border: "none", background: "var(--red)", color: "white", fontSize: 11, fontWeight: 600, cursor: "pointer" }}
+                      >Deletar Questao</button>
                     </div>
                   </div>
-                ))}
+                )}
               </div>
             )}
-          </>
+          </div>
         )}
 
         {tab === "resultados" && (
@@ -5643,67 +6603,82 @@ function ModalGerenciarSimulado({ simuladoId, coachId, onClose }) {
               <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
                 {tentativas.map(tent => {
                   const aluno = alunos.find(a => a.id === tent.alunoId);
-                  const minutos = Math.floor(tent.tempoDecorridoSegundos / 60);
-                  const segundos = tent.tempoDecorridoSegundos % 60;
+                  const minutos = Math.floor((tent.tempoDecorridoSegundos||0) / 60);
+                  const segundos = (tent.tempoDecorridoSegundos||0) % 60;
+                  const fb = feedbackModule.getByTentativa(tent.id);
+                  const fbEnviado = fb?.status === "enviado";
+                  const pct = questoes.length > 0 ? Math.round((tent.acertos / questoes.length) * 100) : 0;
 
                   return (
-                    <div
-                      key={tent.id}
-                      style={{
-                        padding: 14,
-                        borderRadius: 8,
-                        background: "var(--s2)",
-                        border: "1px solid var(--b2)"
-                      }}
-                    >
+                    <div key={tent.id} style={{ padding: 14, borderRadius: 8, background: "var(--s2)", border: `1px solid ${fbEnviado ? "rgba(34,211,165,0.3)" : "var(--b2)"}` }}>
+                      {/* Cabeçalho */}
                       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 12 }}>
                         <div>
-                          <div style={{ fontSize: 13, fontWeight: 600, color: "var(--t1)", marginBottom: 4 }}>
+                          <div style={{ fontSize: 13, fontWeight: 700, color: "var(--t1)", marginBottom: 2 }}>
                             {aluno?.name || "Aluno"}
                           </div>
                           <div style={{ fontSize: 11, color: "var(--t3)" }}>
-                            {new Date(tent.finishedAt).toLocaleDateString("pt-BR", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+                            {new Date(tent.finishedAt).toLocaleDateString("pt-BR", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" })}
+                            {tent.tempoDecorridoSegundos ? ` · ⏱️ ${minutos}m ${segundos}s` : ""}
                           </div>
                         </div>
-                        <div style={{ textAlign: "right" }}>
-                          <div style={{ fontSize: 18, fontWeight: 700, color: tent.acertos >= tent.erros ? "var(--green)" : "var(--red)", marginBottom: 4 }}>
+                        <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+                          <div style={{ fontSize: 20, fontWeight: 900, fontFamily: "Cabinet Grotesk", color: pct >= 60 ? "var(--green)" : "var(--red)" }}>
                             {tent.acertos}/{questoes.length}
                           </div>
-                          <div style={{ fontSize: 11, color: "var(--t3)" }}>
-                            ⏱️ {minutos}m {segundos}s
-                          </div>
+                          <span className={`badge ${pct >= 60 ? "bg" : "br"}`}>{pct}%</span>
                         </div>
                       </div>
 
-                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 10 }}>
+                      {/* Grid acertos/erros */}
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 12 }}>
                         <div style={{ padding: 8, borderRadius: 6, background: "var(--s3)", textAlign: "center" }}>
-                          <div style={{ fontSize: 11, color: "var(--green)", fontWeight: 600 }}>✓ Acertos</div>
-                          <div style={{ fontSize: 16, fontWeight: 700, color: "var(--green)" }}>{tent.acertos}</div>
+                          <div style={{ fontSize: 11, color: "var(--green)", fontWeight: 700 }}>✓ Acertos</div>
+                          <div style={{ fontSize: 18, fontWeight: 900, color: "var(--green)" }}>{tent.acertos}</div>
                         </div>
                         <div style={{ padding: 8, borderRadius: 6, background: "var(--s3)", textAlign: "center" }}>
-                          <div style={{ fontSize: 11, color: "var(--red)", fontWeight: 600 }}>✗ Erros</div>
-                          <div style={{ fontSize: 16, fontWeight: 700, color: "var(--red)" }}>{tent.erros}</div>
+                          <div style={{ fontSize: 11, color: "var(--red)", fontWeight: 700 }}>✗ Erros</div>
+                          <div style={{ fontSize: 18, fontWeight: 900, color: "var(--red)" }}>{tent.erros}</div>
                         </div>
                       </div>
 
-                      {tent.respostasIncorretas?.length > 0 && (
-                        <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid var(--b2)" }}>
-                          <div style={{ fontSize: 11, fontWeight: 600, color: "var(--t2)", marginBottom: 6 }}>
-                            Questões com erro:
-                          </div>
-                          <div style={{ fontSize: 11, color: "var(--t3)", display: "flex", flexDirection: "column", gap: 4 }}>
-                            {tent.respostasIncorretas.map((q, idx) => (
-                              <div key={idx}>• {q.questaoEnunciado?.substring(0, 60)}...</div>
-                            ))}
-                          </div>
+                      {/* Botões */}
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", paddingTop: 10, borderTop: "1px solid var(--b2)", gap: 8, flexWrap: "wrap" }}>
+                        <div style={{ fontSize: 11, color: fbEnviado ? "var(--green)" : "var(--t3)", fontWeight: 600 }}>
+                          {fbEnviado ? "✅ Feedback enviado ao aluno" : fb ? "📝 Rascunho salvo" : "⏳ Sem feedback ainda"}
                         </div>
-                      )}
+                        <div style={{ display: "flex", gap: 8 }}>
+                          <button
+                            onClick={() => setRelatorioTentativaId(tent.id)}
+                            style={{
+                              padding: "6px 14px", borderRadius: 6, border: "none",
+                              background: fbEnviado ? "var(--green-d)" : "var(--blue-d)",
+                              color: fbEnviado ? "var(--green)" : "var(--blue)",
+                              fontSize: 12, fontWeight: 700, cursor: "pointer"
+                            }}
+                          >
+                            {fbEnviado ? "✅ Ver Resultado Completo" : "🔍 Ver Resultado Completo"}
+                          </button>
+                        </div>
+                      </div>
                     </div>
                   );
                 })}
               </div>
             )}
           </div>
+        )}
+
+        </div>{/* fim corpo com scroll */}
+
+        {relatorioTentativaId && (
+          <ModalResultadoCompleto
+            tentativaId={relatorioTentativaId}
+            coachId={coachId}
+            questoes={questoes}
+            alunos={alunos}
+            onClose={() => { setRelatorioTentativaId(null); setTick(t=>t+1); }}
+          />
         )}
 
         {adicionandoQuestao && (
@@ -5989,84 +6964,943 @@ function ModalAdicionarQuestao({ simuladoId, onClose }) {
 }
 
 // ============================================================
-// COACH: Ranking de Alunos
+// PDF EXPORT HELPER
+// ============================================================
+function gerarPDFSimulado(tentativa, simulado, aluno, questoes, fb) {
+  const total = questoes.length;
+  const pct = total > 0 ? Math.round((tentativa.acertos / total) * 100) : 0;
+  const data = new Date(tentativa.finishedAt).toLocaleDateString("pt-BR", { day:"2-digit", month:"long", year:"numeric" });
+  const linhasQuestoes = questoes.map((q, i) => {
+    const resp = tentativa.respostas?.find(r => r.questaoId === q.id);
+    const respostaAluno = resp?.resposta || "—";
+    const acertou = respostaAluno === q.gabarito;
+    const coment = fb?.comentariosQuestoes?.find(c => c.questaoId === q.id);
+    const altRows = q.tipo === "multipla"
+      ? (q.alternativas || []).map((alt, idx) => {
+          const letra = String.fromCharCode(65 + idx);
+          const isGab = letra === q.gabarito;
+          const isResp = letra === respostaAluno;
+          const bg = isGab ? "#d1fae5" : (isResp && !acertou ? "#fee2e2" : "#f3f4f6");
+          const fw = (isGab || (isResp && !acertou)) ? "bold" : "normal";
+          const mark = isGab ? " ✓ gabarito" : (isResp && !acertou ? " ← resposta" : "");
+          return `<div style="background:${bg};padding:4px 8px;border-radius:4px;font-size:12px;font-weight:${fw};margin:2px 0">${letra}. ${alt}${mark}</div>`;
+        }).join("")
+      : (() => {
+          const ops = ["C","E"].map(op => {
+            const label = op === "C" ? "Certo" : "Errado";
+            const isGab = op === q.gabarito;
+            const isResp = op === respostaAluno;
+            const bg = isGab ? "#d1fae5" : (isResp && !acertou ? "#fee2e2" : "#f3f4f6");
+            const mark = isGab ? " ✓" : (isResp && !acertou ? " ←" : "");
+            return `<span style="background:${bg};padding:4px 12px;border-radius:4px;font-size:12px;font-weight:bold;margin-right:6px">${label}${mark}</span>`;
+          });
+          return ops.join("");
+        })();
+    const comentHtml = coment?.comentario
+      ? `<div style="margin-top:8px;padding:8px;background:#eff6ff;border-left:3px solid #3b82f6;border-radius:4px;font-size:12px"><strong>💬 Comentário do professor:</strong><br>${coment.comentario}</div>` : "";
+    const border = acertou ? "#10b981" : "#ef4444";
+    const icon = acertou ? "✓" : "✗";
+    const iconBg = acertou ? "#10b981" : "#ef4444";
+    return `<div style="border:1.5px solid ${border};border-radius:8px;padding:14px;margin-bottom:12px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+        <span style="background:${iconBg};color:white;width:22px;height:22px;border-radius:5px;display:inline-flex;align-items:center;justify-content:center;font-weight:bold;font-size:12px">${icon}</span>
+        <strong style="font-size:12px">Questão ${i+1}</strong>
+        <span style="font-size:11px;color:#6b7280">${q.tipo==="ce"?"Certo/Errado":"Múltipla Escolha"}</span>
+      </div>
+      <div style="font-size:13px;margin-bottom:8px;line-height:1.5">${q.enunciado}</div>
+      ${altRows}
+      <div style="margin-top:8px;font-size:12px;font-weight:bold;color:${acertou?"#10b981":"#ef4444"}">${acertou ? "✓ Correto" : `✗ Respondeu: ${respostaAluno} · Gabarito: ${q.gabarito}`}</div>
+      ${comentHtml}
+    </div>`;
+  }).join("");
+  const orientHtml = fb?.orientacoesGerais ? `<div style="padding:12px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;margin-bottom:12px"><strong>📋 Orientações Gerais:</strong><br><span style="font-size:13px">${fb.orientacoesGerais}</span></div>` : "";
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Relatório − ${aluno?.name || "Aluno"}</title>
+  <style>body{font-family:Arial,sans-serif;max-width:800px;margin:0 auto;padding:24px;color:#1f2937}@media print{button{display:none}}</style></head><body>
+  <h1 style="font-size:22px;margin-bottom:4px">📄 Relatório de Correção</h1>
+  <div style="font-size:14px;color:#6b7280;margin-bottom:20px">${simulado?.nome} · ${aluno?.name || "Aluno"} · ${data}</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:20px">
+    <div style="text-align:center;padding:12px;background:#f0fdf4;border-radius:8px"><div style="font-size:26px;font-weight:900;color:#10b981">${tentativa.acertos}</div><div style="font-size:11px;font-weight:bold;text-transform:uppercase;color:#10b981">Acertos</div></div>
+    <div style="text-align:center;padding:12px;background:#fef2f2;border-radius:8px"><div style="font-size:26px;font-weight:900;color:#ef4444">${tentativa.erros}</div><div style="font-size:11px;font-weight:bold;text-transform:uppercase;color:#ef4444">Erros</div></div>
+    <div style="text-align:center;padding:12px;background:#f3f4f6;border-radius:8px"><div style="font-size:26px;font-weight:900;color:${pct>=60?"#10b981":"#ef4444"}">${pct}%</div><div style="font-size:11px;font-weight:bold;text-transform:uppercase">Aproveitamento</div></div>
+  </div>
+  ${orientHtml}
+  <h2 style="font-size:15px;margin-bottom:12px">Questões</h2>
+  ${linhasQuestoes}
+  <button onclick="window.print()" style="margin-top:16px;padding:10px 20px;background:#10b981;color:white;border:none;border-radius:6px;font-size:14px;font-weight:bold;cursor:pointer">🖨️ Imprimir / Salvar PDF</button>
+  </body></html>`;
+  const w = window.open("", "_blank");
+  w.document.write(html);
+  w.document.close();
+}
+
+// ============================================================
+// COACH: Modal Resultado Completo (correção + comentários + PDF + envio)
+// ============================================================
+function ModalResultadoCompleto({ tentativaId, coachId, questoes, alunos, onClose }) {
+  const tentativa = tentativasModule.getById(tentativaId);
+  const fbExistente = feedbackModule.getByTentativa(tentativaId);
+  if (!tentativa) return null;
+  const aluno = alunos?.find(a => a.id === tentativa.alunoId) || usersModule.getById(tentativa.alunoId);
+  const simulado = simuladosModule.getById(tentativa.simuladoId);
+  const total = questoes.length;
+  const pct = total > 0 ? Math.round((tentativa.acertos / total) * 100) : 0;
+
+  const initComents = () => questoes.map(q => {
+    const ex = fbExistente?.comentariosQuestoes?.find(c => c.questaoId === q.id);
+    const resp = tentativa?.respostas?.find(r => r.questaoId === q.id);
+    const acertou = resp?.resposta === q.gabarito;
+    return { questaoId: q.id, acertou, comentario: ex?.comentario || "" };
+  });
+
+  const [comentarios, setComentarios] = useState(initComents);
+  const [orientacoesGerais, setOrientacoesGerais] = useState(fbExistente?.orientacoesGerais || "");
+  const [saved, setSaved] = useState(false);
+  const [enviado, setEnviado] = useState(fbExistente?.status === "enviado");
+
+  function updateComentario(idx, val) {
+    setComentarios(prev => prev.map((c, i) => i === idx ? { ...c, comentario: val } : c));
+  }
+
+  function salvar(status) {
+    feedbackModule.salvar(coachId, tentativaId, {
+      comentariosQuestoes: comentarios.map(c => ({ ...c, explicacao: "" })),
+      orientacoesGerais, status,
+      sugestoesConteudo: fbExistente?.sugestoesConteudo || "",
+      temasRevisar: fbExistente?.temasRevisar || [],
+    });
+    if (status === "enviado") { setEnviado(true); setSaved(true); setTimeout(onClose, 800); }
+    else { setSaved(true); setTimeout(() => setSaved(false), 2000); }
+  }
+
+  function handlePDF() {
+    const fb = { comentariosQuestoes: comentarios, orientacoesGerais };
+    gerarPDFSimulado(tentativa, simulado, aluno, questoes, fb);
+  }
+
+  const overlay = { position:"fixed",inset:0,background:"rgba(0,0,0,0.85)",display:"flex",alignItems:"flex-start",justifyContent:"center",zIndex:2000,padding:"20px 12px",overflowY:"auto" };
+  const box = { background:"var(--s1)",borderRadius:14,maxWidth:720,width:"100%",padding:28,margin:"0 auto",maxHeight:"calc(100vh - 40px)",overflowY:"auto" };
+  const inp = { width:"100%",padding:"8px 10px",borderRadius:6,border:"1px solid var(--b2)",background:"var(--s3)",color:"var(--t1)",fontSize:12,fontFamily:"inherit",resize:"vertical",boxSizing:"border-box" };
+
+  return (
+    <div style={overlay} onClick={onClose}>
+      <div style={box} onClick={e => e.stopPropagation()}>
+
+        {/* Header */}
+        <div style={{ display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:20 }}>
+          <div>
+            <div style={{ fontSize:11,fontWeight:700,letterSpacing:1,textTransform:"uppercase",color:"var(--t3)",marginBottom:4 }}>Resultado Completo</div>
+            <h2 style={{ fontSize:18,fontWeight:900,marginBottom:2 }}>🔍 {aluno?.name || "Aluno"}</h2>
+            <div style={{ fontSize:12,color:"var(--t3)" }}>{simulado?.nome} · {new Date(tentativa.finishedAt).toLocaleDateString("pt-BR",{day:"2-digit",month:"short",year:"numeric"})}</div>
+          </div>
+          <div style={{ display:"flex",gap:8,flexWrap:"wrap",justifyContent:"flex-end" }}>
+            <button onClick={handlePDF} style={{ padding:"8px 14px",borderRadius:8,border:"none",background:"var(--amber)",color:"#07080f",fontSize:12,fontWeight:700,cursor:"pointer" }}>📄 Gerar PDF</button>
+            <button onClick={onClose} style={{ padding:"8px 14px",borderRadius:8,border:"none",background:"var(--b2)",color:"var(--t1)",fontSize:12,fontWeight:700,cursor:"pointer" }}>✕ Fechar</button>
+          </div>
+        </div>
+
+        {/* Placar */}
+        <div style={{ display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:20 }}>
+          <div style={{ padding:14,borderRadius:10,background:"var(--green-d)",textAlign:"center" }}>
+            <div style={{ fontSize:26,fontWeight:900,fontFamily:"Cabinet Grotesk",color:"var(--green)" }}>{tentativa.acertos}</div>
+            <div style={{ fontSize:10,color:"var(--green)",fontWeight:700,textTransform:"uppercase" }}>✓ Acertos</div>
+          </div>
+          <div style={{ padding:14,borderRadius:10,background:"rgba(239,68,68,.1)",textAlign:"center" }}>
+            <div style={{ fontSize:26,fontWeight:900,fontFamily:"Cabinet Grotesk",color:"var(--red)" }}>{tentativa.erros}</div>
+            <div style={{ fontSize:10,color:"var(--red)",fontWeight:700,textTransform:"uppercase" }}>✗ Erros</div>
+          </div>
+          <div style={{ padding:14,borderRadius:10,background:"var(--s2)",textAlign:"center" }}>
+            <div style={{ fontSize:26,fontWeight:900,fontFamily:"Cabinet Grotesk",color:pct>=60?"var(--green)":"var(--red)" }}>{pct}%</div>
+            <div style={{ fontSize:10,color:"var(--t3)",fontWeight:700,textTransform:"uppercase" }}>Aproveitamento</div>
+          </div>
+        </div>
+
+        {/* Questões */}
+        <div style={{ display:"flex",flexDirection:"column",gap:14,marginBottom:20 }}>
+          {questoes.map((q, i) => {
+            const resp = tentativa.respostas?.find(r => r.questaoId === q.id);
+            const respostaAluno = resp?.resposta;
+            const acertou = respostaAluno === q.gabarito;
+            const c = comentarios[i] || {};
+
+            return (
+              <div key={q.id} style={{ padding:16,borderRadius:10,background:acertou?"var(--green-d)":"rgba(239,68,68,.08)",border:`1.5px solid ${acertou?"var(--green)":"var(--red)"}` }}>
+                {/* Q header */}
+                <div style={{ display:"flex",alignItems:"center",gap:8,marginBottom:10 }}>
+                  <div style={{ width:26,height:26,borderRadius:6,background:acertou?"var(--green)":"var(--red)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,fontWeight:900,color:"white",flexShrink:0 }}>{acertou?"✓":"✗"}</div>
+                  <div style={{ fontSize:12,fontWeight:700,color:"var(--t3)",textTransform:"uppercase",letterSpacing:.5 }}>Questão {i+1} · {q.tipo==="ce"?"Certo/Errado":"Múltipla Escolha"}</div>
+                </div>
+                <div style={{ fontSize:13,color:"var(--t1)",lineHeight:1.6,marginBottom:10 }}>{q.enunciado}</div>
+
+                {/* Alternativas múltipla */}
+                {q.tipo==="multipla" && (
+                  <div style={{ display:"flex",flexDirection:"column",gap:4,marginBottom:10 }}>
+                    {(q.alternativas||[]).map((alt,idx) => {
+                      const letra = String.fromCharCode(65+idx);
+                      const isGab = letra===q.gabarito;
+                      const isResp = letra===respostaAluno;
+                      let bg="var(--s3)",color="var(--t2)",border="1px solid transparent";
+                      if (isGab) { bg="var(--green-d)"; color="var(--green)"; border="1px solid var(--green)"; }
+                      else if (isResp&&!acertou) { bg="rgba(239,68,68,.12)"; color="var(--red)"; border="1px solid var(--red)"; }
+                      return (
+                        <div key={idx} style={{ padding:"6px 10px",borderRadius:6,background:bg,color,border,fontSize:12,display:"flex",gap:8,alignItems:"center" }}>
+                          <span style={{ fontWeight:700,minWidth:18 }}>{letra}.</span>
+                          <span style={{ flex:1 }}>{alt}</span>
+                          {isGab&&<span style={{ fontSize:10,fontWeight:700 }}>✓ Gabarito</span>}
+                          {isResp&&!acertou&&<span style={{ fontSize:10,fontWeight:700 }}>← Aluno</span>}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {/* Certo/Errado */}
+                {q.tipo==="ce" && (
+                  <div style={{ display:"flex",gap:8,marginBottom:10 }}>
+                    {["C","E"].map(op => {
+                      const label=op==="C"?"Certo":"Errado";
+                      const isGab=op===q.gabarito;
+                      const isResp=op===respostaAluno;
+                      let bg="var(--s3)",color="var(--t2)",border="1px solid transparent";
+                      if(isGab){bg="var(--green-d)";color="var(--green)";border="1px solid var(--green)";}
+                      else if(isResp&&!acertou){bg="rgba(239,68,68,.12)";color="var(--red)";border="1px solid var(--red)";}
+                      return (
+                        <div key={op} style={{ padding:"6px 16px",borderRadius:6,background:bg,color,border,fontSize:13,fontWeight:700,display:"flex",gap:5,alignItems:"center" }}>
+                          {label}
+                          {isGab&&<span style={{ fontSize:10 }}>✓</span>}
+                          {isResp&&!acertou&&<span style={{ fontSize:10 }}>←</span>}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                <div style={{ fontSize:12,color:acertou?"var(--green)":"var(--red)",fontWeight:700,marginBottom:10 }}>
+                  {acertou ? "✓ Resposta correta" : respostaAluno ? `✗ Respondeu ${respostaAluno} · Gabarito: ${q.gabarito}` : `✗ Não respondida · Gabarito: ${q.gabarito}`}
+                </div>
+
+                {/* Campo de comentário */}
+                <div>
+                  <label style={{ fontSize:11,fontWeight:700,letterSpacing:.5,textTransform:"uppercase",color:"var(--t3)",display:"block",marginBottom:5 }}>💬 Comentário do professor (opcional)</label>
+                  <textarea style={inp} rows={2} value={c.comentario||""} onChange={e=>updateComentario(i,e.target.value)} placeholder={acertou ? "Reforce o ponto positivo ou explique o conceito..." : "Explique o erro, oriente o aluno..."}/>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Orientações gerais */}
+        <div style={{ marginBottom:20 }}>
+          <label style={{ fontSize:11,fontWeight:700,letterSpacing:.5,textTransform:"uppercase",color:"var(--t3)",display:"block",marginBottom:8 }}>📋 Orientações Gerais (visível ao aluno)</label>
+          <textarea style={{ ...inp,minHeight:80 }} value={orientacoesGerais} onChange={e=>setOrientacoesGerais(e.target.value)} placeholder="Pontos de atenção, sugestões de estudo, parabéns, etc..."/>
+        </div>
+
+        {/* Ações */}
+        <div style={{ display:"flex",gap:10,flexWrap:"wrap" }}>
+          <button onClick={()=>salvar("rascunho")} style={{ flex:1,minWidth:130,padding:"12px",borderRadius:10,border:"none",background:"var(--s3)",color:"var(--t1)",fontSize:13,fontWeight:700,cursor:"pointer" }}>
+            {saved&&!enviado ? "✅ Salvo!" : "💾 Salvar Rascunho"}
+          </button>
+          <button onClick={()=>salvar("enviado")} disabled={enviado} style={{ flex:2,minWidth:180,padding:"12px",borderRadius:10,border:"none",background:enviado?"var(--green-d)":"var(--green)",color:enviado?"var(--green)":"#07080f",fontSize:13,fontWeight:900,cursor:enviado?"default":"pointer",fontFamily:"Cabinet Grotesk" }}>
+            {enviado ? "✅ Relatório já enviado ao aluno" : "📨 Enviar Relatório ao Aluno"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// ALUNO: Modal para visualizar feedback recebido do coach
+// ============================================================
+function ModalVerFeedback({ tentativaId, onClose }) {
+  const tentativa = tentativasModule.getById(tentativaId);
+  const fb = feedbackModule.getEnviadoParaAluno(tentativaId);
+  if (!tentativa || !fb) return null;
+
+  const simulado = simuladosModule.getById(tentativa.simuladoId);
+  const questoes = questoesModule.getBySimulado(tentativa.simuladoId);
+  const total = questoes.length;
+  const pct = total > 0 ? Math.round((tentativa.acertos / total) * 100) : 0;
+  const coach = usersModule.getById(fb.coachId);
+
+  function handlePDF() {
+    gerarPDFSimulado(tentativa, simulado, { name: "Você" }, questoes, fb);
+  }
+
+  return (
+    <div style={{ position:"fixed",inset:0,background:"rgba(0,0,0,0.85)",display:"flex",alignItems:"flex-start",justifyContent:"center",zIndex:2000,overflowY:"auto",padding:"20px 12px" }}>
+      <div style={{ background:"var(--s1)",borderRadius:14,maxWidth:700,width:"100%",padding:28 }} onClick={e=>e.stopPropagation()}>
+
+        <div style={{ display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:20 }}>
+          <div>
+            <div style={{ fontSize:11,fontWeight:700,letterSpacing:1,textTransform:"uppercase",color:"var(--green)",marginBottom:4 }}>📘 Revisão do Professor</div>
+            <h2 style={{ fontSize:18,fontWeight:900,marginBottom:2 }}>{simulado?.nome}</h2>
+            <div style={{ fontSize:12,color:"var(--t3)" }}>Enviado por {coach?.name||"Coach"} · {new Date(fb.enviadoEm).toLocaleDateString("pt-BR",{day:"2-digit",month:"short",year:"numeric"})}</div>
+          </div>
+          <div style={{ display:"flex",gap:8 }}>
+            <button onClick={handlePDF} style={{ padding:"8px 14px",borderRadius:8,border:"none",background:"var(--amber)",color:"#07080f",fontSize:12,fontWeight:700,cursor:"pointer" }}>📄 Gerar PDF</button>
+            <button onClick={onClose} style={{ padding:"8px 14px",borderRadius:8,border:"none",background:"var(--b2)",color:"var(--t1)",fontSize:12,fontWeight:700,cursor:"pointer" }}>Fechar</button>
+          </div>
+        </div>
+
+        {/* Placar */}
+        <div style={{ display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:20 }}>
+          <div style={{ padding:12,borderRadius:10,background:"var(--green-d)",textAlign:"center" }}>
+            <div style={{ fontSize:24,fontWeight:900,fontFamily:"Cabinet Grotesk",color:"var(--green)" }}>{tentativa.acertos}</div>
+            <div style={{ fontSize:10,color:"var(--green)",fontWeight:700,textTransform:"uppercase" }}>Acertos</div>
+          </div>
+          <div style={{ padding:12,borderRadius:10,background:"rgba(239,68,68,.1)",textAlign:"center" }}>
+            <div style={{ fontSize:24,fontWeight:900,fontFamily:"Cabinet Grotesk",color:"var(--red)" }}>{tentativa.erros}</div>
+            <div style={{ fontSize:10,color:"var(--red)",fontWeight:700,textTransform:"uppercase" }}>Erros</div>
+          </div>
+          <div style={{ padding:12,borderRadius:10,background:"var(--s2)",textAlign:"center" }}>
+            <div style={{ fontSize:24,fontWeight:900,fontFamily:"Cabinet Grotesk",color:pct>=60?"var(--green)":"var(--red)" }}>{pct}%</div>
+            <div style={{ fontSize:10,color:"var(--t3)",fontWeight:700,textTransform:"uppercase" }}>Aproveitamento</div>
+          </div>
+        </div>
+
+        {/* Orientações gerais */}
+        {fb.orientacoesGerais && (
+          <div style={{ padding:14,borderRadius:10,background:"var(--blue-d)",border:"1px solid var(--blue)",marginBottom:16 }}>
+            <div style={{ fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:.5,color:"var(--blue)",marginBottom:6 }}>📋 Orientações do Professor</div>
+            <div style={{ fontSize:13,color:"var(--t1)",lineHeight:1.6 }}>{fb.orientacoesGerais}</div>
+          </div>
+        )}
+
+        {/* Todas as questões */}
+        <div style={{ fontSize:11,fontWeight:700,letterSpacing:.5,textTransform:"uppercase",color:"var(--t3)",marginBottom:10 }}>Questão por Questão</div>
+        <div style={{ display:"flex",flexDirection:"column",gap:12 }}>
+          {questoes.map((q, i) => {
+            const resp = tentativa.respostas?.find(r => r.questaoId === q.id);
+            const respostaAluno = resp?.resposta;
+            const acertou = respostaAluno === q.gabarito;
+            const coment = fb.comentariosQuestoes?.find(c => c.questaoId === q.id);
+
+            return (
+              <div key={q.id} style={{ padding:14,borderRadius:10,background:acertou?"var(--green-d)":"rgba(239,68,68,.08)",border:`1.5px solid ${acertou?"var(--green)":"var(--red)"}` }}>
+                <div style={{ display:"flex",alignItems:"center",gap:8,marginBottom:8 }}>
+                  <div style={{ width:24,height:24,borderRadius:5,background:acertou?"var(--green)":"var(--red)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:900,color:"white",flexShrink:0 }}>{acertou?"✓":"✗"}</div>
+                  <div style={{ fontSize:12,fontWeight:700,color:"var(--t3)",textTransform:"uppercase",letterSpacing:.5 }}>Questão {i+1}</div>
+                </div>
+                <div style={{ fontSize:13,color:"var(--t1)",lineHeight:1.6,marginBottom:8 }}>{q.enunciado}</div>
+
+                {q.tipo==="multipla" && (
+                  <div style={{ display:"flex",flexDirection:"column",gap:3,marginBottom:8 }}>
+                    {(q.alternativas||[]).map((alt,idx)=>{
+                      const letra=String.fromCharCode(65+idx);
+                      const isGab=letra===q.gabarito;
+                      const isResp=letra===respostaAluno;
+                      let bg="var(--s3)",color="var(--t2)",border="1px solid transparent";
+                      if(isGab){bg="var(--green-d)";color="var(--green)";border="1px solid var(--green)";}
+                      else if(isResp&&!acertou){bg="rgba(239,68,68,.12)";color="var(--red)";border="1px solid var(--red)";}
+                      return(
+                        <div key={idx} style={{padding:"5px 10px",borderRadius:5,background:bg,color,border,fontSize:12,display:"flex",gap:7,alignItems:"center"}}>
+                          <span style={{fontWeight:700,minWidth:16}}>{letra}.</span>
+                          <span style={{flex:1}}>{alt}</span>
+                          {isGab&&<span style={{fontSize:10,fontWeight:700}}>✓ Gabarito</span>}
+                          {isResp&&!acertou&&<span style={{fontSize:10,fontWeight:700}}>← Sua resposta</span>}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {q.tipo==="ce" && (
+                  <div style={{display:"flex",gap:8,marginBottom:8}}>
+                    {["C","E"].map(op=>{
+                      const label=op==="C"?"Certo":"Errado";
+                      const isGab=op===q.gabarito;
+                      const isResp=op===respostaAluno;
+                      let bg="var(--s3)",color="var(--t2)",border="1px solid transparent";
+                      if(isGab){bg="var(--green-d)";color="var(--green)";border="1px solid var(--green)";}
+                      else if(isResp&&!acertou){bg="rgba(239,68,68,.12)";color="var(--red)";border="1px solid var(--red)";}
+                      return(
+                        <div key={op} style={{padding:"5px 14px",borderRadius:5,background:bg,color,border,fontSize:12,fontWeight:700,display:"flex",gap:5,alignItems:"center"}}>
+                          {label}{isGab&&<span style={{fontSize:10}}>✓</span>}{isResp&&!acertou&&<span style={{fontSize:10}}>←</span>}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                <div style={{ fontSize:12,color:acertou?"var(--green)":"var(--red)",fontWeight:700,marginBottom: coment?.comentario?8:0 }}>
+                  {acertou?"✓ Correto":respostaAluno?`✗ Você respondeu ${respostaAluno} · Gabarito: ${q.gabarito}`:`✗ Não respondida · Gabarito: ${q.gabarito}`}
+                </div>
+
+                {coment?.comentario && (
+                  <div style={{ padding:"10px 12px",borderRadius:8,background:"var(--blue-d)",border:"1px solid var(--blue)" }}>
+                    <div style={{ fontSize:10,fontWeight:700,textTransform:"uppercase",color:"var(--blue)",marginBottom:4 }}>💬 Comentário do professor</div>
+                    <div style={{ fontSize:12,color:"var(--t1)",lineHeight:1.6 }}>{coment.comentario}</div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        <button onClick={onClose} style={{ width:"100%",marginTop:20,padding:"12px",borderRadius:10,border:"none",background:"var(--s3)",color:"var(--t1)",fontSize:14,fontWeight:700,cursor:"pointer" }}>Fechar</button>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// COACH: Ranking
 // ============================================================
 function CoachRanking({ user }) {
-  const editais = editaisModule.getByCoach(user.id);
-  const [editalId, setEditalId] = useState(editais[0]?.id || "");
+  const [tick, setTick] = useState(0);
   const alunos = usersModule.getAlunos(user.id);
-  const planos = storage.get().planos;
-
-  const edital = editaisModule.getById(editalId);
-
-  const ranking = alunos.map(a => {
-    const plano = planos.find(p => p.alunoId === a.id && p.editalId === editalId);
-    if (!plano) return { aluno: a, xp: 0, aulas: 0, streak: 0, nivel: gamificacaoModule.getNivel(0), plano: null };
+  function buildRanking(a) {
+    const plano = planosModule.getByAluno(a.id)[0];
+    if (!plano) return null;
     const xp = gamificacaoModule.calcXP(a.id, plano.id);
-    const stats = progressoModule.getStats(a.id, plano.id);
-    const streak = gamificacaoModule.getStreakAtual(a.id, plano.id);
     const nivel = gamificacaoModule.getNivel(xp);
+    const streak = gamificacaoModule.getStreakAtual(a.id, plano.id);
+    const stats = progressoModule.getStats(a.id, plano.id);
     return { aluno: a, xp, aulas: stats?.aulasFeitas || 0, streak, nivel, plano, pct: stats?.pct || 0 };
-  }).sort((a, b) => b.xp - a.xp || b.aulas - a.aulas);
-
-  const posClass = (i) => i===0?"rank-1":i===1?"rank-2":i===2?"rank-3":"";
-  const posEmoji = (i) => i===0?"🥇":i===1?"🥈":i===2?"🥉":"";
+  }
+  const ranking = alunos.map(buildRanking).filter(Boolean).sort((a,b) => b.xp - a.xp);
 
   return (
     <div>
-      <div className="ph"><div><h1>🏆 Ranking de Alunos</h1><p>Classificação por edital</p></div></div>
-      {editais.length > 1 && (
-        <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:20}}>
-          {editais.map(e => (
-            <button key={e.id} className={`preset-btn${editalId===e.id?" active":""}`} onClick={()=>setEditalId(e.id)}>{e.name}</button>
-          ))}
-        </div>
-      )}
-      {!edital ? (
-        <div className="card"><div className="empty"><h3>Nenhum edital</h3></div></div>
-      ) : (
-        <div className="card">
-          <div className="card-title" style={{marginBottom:16}}>{edital.name}</div>
-          {ranking.length === 0 ? (
-            <p className="text-muted text-sm">Nenhum aluno neste edital.</p>
-          ) : (
+      <div className="ph"><div><h1>Ranking</h1><p>Desempenho dos alunos</p></div></div>
+      {ranking.length === 0
+        ? <div className="card"><div className="empty"><h3>Nenhum aluno com plano ativo</h3></div></div>
+        : (
+          <div className="card">
             <table className="rank-table">
-              <thead>
-                <tr>
-                  <th style={{width:50}}>#</th>
-                  <th>Aluno</th>
-                  <th>Nível</th>
-                  <th>XP</th>
-                  <th>Aulas</th>
-                  <th>🔥 Streak</th>
-                  <th>Progresso</th>
-                </tr>
-              </thead>
+              <thead><tr><th>#</th><th>Aluno</th><th>XP</th><th>Nível</th><th>Aulas</th><th>Streak</th><th>%</th></tr></thead>
               <tbody>
                 {ranking.map((r, i) => (
                   <tr key={r.aluno.id}>
-                    <td><div className={`rank-pos ${posClass(i)}`}>{posEmoji(i)||`${i+1}`}</div></td>
+                    <td><div className={`rank-pos rank-${i+1}`}>{i+1}</div></td>
+                    <td><div style={{fontWeight:600}}>{r.aluno.name}</div></td>
+                    <td><div style={{fontWeight:700,color:"var(--amber)"}}>{r.xp} XP</div></td>
+                    <td><div style={{fontSize:12}}>{r.nivel.icon} {r.nivel.name}</div></td>
+                    <td>{r.aulas}</td>
+                    <td>{r.streak > 0 ? `🔥 ${r.streak}` : "—"}</td>
                     <td>
-                      <div className="fw6">{r.aluno.name}</div>
-                      <div className="text-xs text-dim">{r.aluno.email}</div>
-                    </td>
-                    <td><span className="badge bn">{r.nivel.emoji} {r.nivel.name}</span></td>
-                    <td><span style={{fontFamily:"Cabinet Grotesk",fontWeight:900,color:"var(--purple)"}}>{r.xp}</span></td>
-                    <td><span style={{fontFamily:"Cabinet Grotesk",fontWeight:700,color:"var(--green)"}}>{r.aulas}</span></td>
-                    <td><span style={{fontFamily:"Cabinet Grotesk",fontWeight:700,color:"var(--amber)"}}>{r.streak}</span></td>
-                    <td style={{minWidth:120}}>
-                      {r.plano ? (
-                        <>
-                          <div style={{fontSize:11,color:"var(--t3)",marginBottom:4}}>{r.pct}%</div>
-                          <PBar pct={r.pct}/>
-                        </>
-                      ) : <span className="text-dim text-xs">Sem plano</span>}
+                      <div style={{fontSize:11,color:"var(--t3)",marginBottom:4}}>{r.pct}%</div>
+                      <PBar pct={r.pct}/>
                     </td>
                   </tr>
                 ))}
               </tbody>
             </table>
-          )}
+          </div>
+        )
+      }
+    </div>
+  );
+}
+
+// ============================================================
+// GERADOR DE PROMPT
+// ============================================================
+// ============================================================
+// BATALHA: Coach cria e gerencia batalhas
+// ============================================================
+function CoachBatalha({ user, refresh }) {
+  const [tick, setTick] = useState(0);
+  const [criando, setCriando] = useState(false);
+  const [verRanking, setVerRanking] = useState(null);
+  const batalhas = batalhasModule.getByCoach(user.id);
+  const alunos = usersModule.getAlunos(user.id);
+  const editais = editaisModule.getByCoach(user.id);
+  const simuladosList = editais.flatMap(e => simuladosModule.getByEdital(e.id));
+
+  function reload() { setTick(t => t+1); refresh && refresh(); }
+
+  const emojis = ["⚔️","🔥","🧠","🏆","💥","🎯","⚡","🥊"];
+  const emoji = (b) => emojis[b.id.charCodeAt(0) % emojis.length];
+
+  return (
+    <div>
+      <div className="ph" style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+        <div><h1>⚔️ Batalhas</h1><p>Crie competicoes entre seus alunos</p></div>
+        <button className="btn btn-green" onClick={() => setCriando(true)}>+ Nova Batalha</button>
+      </div>
+
+      {batalhas.length === 0 ? (
+        <div className="card"><div className="empty"><h3>Nenhuma batalha criada ainda</h3><p>Crie uma batalha para engajar seus alunos!</p></div></div>
+      ) : (
+        <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
+          {batalhas.map(b => {
+            const sim = simuladosModule.getById(b.simuladoId);
+            const total = b.participantes?.length || 0;
+            const finalizados = b.participantes?.filter(p => p.finalizado).length || 0;
+            const vencedor = batalhasModule.getRanking(b.id)[0];
+            const vencedorUser = vencedor ? usersModule.getById(vencedor.alunoId) : null;
+            return (
+              <div key={b.id} style={{ padding:20, borderRadius:12, background:"var(--s1)", border:"1px solid var(--b2)" }}>
+                <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:12 }}>
+                  <div>
+                    <div style={{ fontSize:18, fontWeight:900, fontFamily:"Cabinet Grotesk", marginBottom:4 }}>
+                      {emoji(b)} {b.nome}
+                    </div>
+                    <div style={{ fontSize:12, color:"var(--t3)" }}>
+                      {sim?.nome || "Simulado"} · Encerra: {b.dataFim ? new Date(b.dataFim+"T00:00:00").toLocaleDateString("pt-BR") : "Sem limite"}
+                    </div>
+                  </div>
+                  <span className={"badge " + (b.status === "ativa" ? "bg" : "br")}>
+                    {b.status === "ativa" ? "Ativa" : "Encerrada"}
+                  </span>
+                </div>
+                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:8, marginBottom:12 }}>
+                  <div style={{ padding:10, borderRadius:8, background:"var(--s2)", textAlign:"center" }}>
+                    <div style={{ fontSize:20, fontWeight:900, fontFamily:"Cabinet Grotesk" }}>{total}</div>
+                    <div style={{ fontSize:10, color:"var(--t3)", textTransform:"uppercase" }}>Participantes</div>
+                  </div>
+                  <div style={{ padding:10, borderRadius:8, background:"var(--s2)", textAlign:"center" }}>
+                    <div style={{ fontSize:20, fontWeight:900, fontFamily:"Cabinet Grotesk", color:"var(--green)" }}>{finalizados}</div>
+                    <div style={{ fontSize:10, color:"var(--t3)", textTransform:"uppercase" }}>Finalizaram</div>
+                  </div>
+                  <div style={{ padding:10, borderRadius:8, background:"var(--s2)", textAlign:"center" }}>
+                    <div style={{ fontSize:13, fontWeight:700, color:"var(--amber)" }}>{vencedorUser ? vencedorUser.name.split(" ")[0] : "-"}</div>
+                    <div style={{ fontSize:10, color:"var(--t3)", textTransform:"uppercase" }}>Lider</div>
+                  </div>
+                </div>
+                <div style={{ display:"flex", gap:8 }}>
+                  <button onClick={() => setVerRanking(b.id)} style={{ flex:1, padding:"8px", borderRadius:8, border:"none", background:"var(--blue-d)", color:"var(--blue)", fontSize:12, fontWeight:700, cursor:"pointer" }}>
+                    Ver Ranking
+                  </button>
+                  {b.status === "ativa" && (
+                    <button onClick={() => { batalhasModule.encerrar(b.id); reload(); }} style={{ padding:"8px 14px", borderRadius:8, border:"1px solid var(--b2)", background:"transparent", color:"var(--t2)", fontSize:12, cursor:"pointer" }}>
+                      Encerrar
+                    </button>
+                  )}
+                  <button onClick={() => { if(window.confirm("Deletar batalha?")) { batalhasModule.delete(b.id); reload(); } }} style={{ padding:"8px 10px", borderRadius:8, border:"none", background:"rgba(239,68,68,.1)", color:"var(--red)", fontSize:12, cursor:"pointer" }}>
+                    Excluir
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {criando && <ModalCriarBatalha coachId={user.id} alunos={alunos} simulados={simuladosList} onClose={() => { setCriando(false); reload(); }} />}
+      {verRanking && <ModalRankingBatalha batalhaId={verRanking} onClose={() => setVerRanking(null)} />}
+    </div>
+  );
+}
+
+function ModalCriarBatalha({ coachId, alunos, simulados, onClose }) {
+  const [nome, setNome] = useState("");
+  const [simuladoId, setSimuladoId] = useState("");
+  const [dataFim, setDataFim] = useState("");
+  const [tempoLimite, setTempoLimite] = useState("");
+  const [selecionados, setSelecionados] = useState([]);
+
+  function toggleAluno(id) {
+    setSelecionados(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+  }
+
+  function criar() {
+    if (!simuladoId) { alert("Selecione um simulado."); return; }
+    if (selecionados.length < 2) { alert("Selecione pelo menos 2 alunos."); return; }
+    batalhasModule.create(coachId, simuladoId, nome || "Batalha", dataFim || null, tempoLimite ? parseInt(tempoLimite) : null, selecionados);
+    onClose();
+  }
+
+  const inp = { width:"100%", padding:"9px 12px", borderRadius:8, border:"1px solid var(--b2)", background:"var(--s2)", color:"var(--t1)", fontSize:13, boxSizing:"border-box" };
+
+  return (
+    <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.85)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:2000, padding:"20px 12px" }}>
+      <div style={{ background:"var(--s1)", borderRadius:14, maxWidth:520, width:"100%", maxHeight:"90vh", overflowY:"auto", padding:28 }} onClick={e => e.stopPropagation()}>
+        <div style={{ fontSize:18, fontWeight:900, marginBottom:20 }}>⚔️ Nova Batalha</div>
+
+        <div style={{ marginBottom:14 }}>
+          <label style={{ fontSize:11, fontWeight:700, color:"var(--t3)", textTransform:"uppercase", letterSpacing:.5, display:"block", marginBottom:5 }}>Nome da batalha (opcional)</label>
+          <input style={inp} value={nome} onChange={e => setNome(e.target.value)} placeholder="Ex: Batalha Direito Constitucional" />
+        </div>
+
+        <div style={{ marginBottom:14 }}>
+          <label style={{ fontSize:11, fontWeight:700, color:"var(--t3)", textTransform:"uppercase", letterSpacing:.5, display:"block", marginBottom:5 }}>Simulado *</label>
+          <select style={inp} value={simuladoId} onChange={e => setSimuladoId(e.target.value)}>
+            <option value="">Selecione um simulado...</option>
+            {simulados.map(s => <option key={s.id} value={s.id}>{s.nome}</option>)}
+          </select>
+        </div>
+
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, marginBottom:14 }}>
+          <div>
+            <label style={{ fontSize:11, fontWeight:700, color:"var(--t3)", textTransform:"uppercase", letterSpacing:.5, display:"block", marginBottom:5 }}>Data limite</label>
+            <input type="date" style={inp} value={dataFim} onChange={e => setDataFim(e.target.value)} />
+          </div>
+          <div>
+            <label style={{ fontSize:11, fontWeight:700, color:"var(--t3)", textTransform:"uppercase", letterSpacing:.5, display:"block", marginBottom:5 }}>Tempo (min)</label>
+            <input type="number" style={inp} value={tempoLimite} onChange={e => setTempoLimite(e.target.value)} placeholder="Sem limite" min="1" />
+          </div>
+        </div>
+
+        <div style={{ marginBottom:20 }}>
+          <label style={{ fontSize:11, fontWeight:700, color:"var(--t3)", textTransform:"uppercase", letterSpacing:.5, display:"block", marginBottom:8 }}>Participantes * (min. 2)</label>
+          <div style={{ display:"flex", flexDirection:"column", gap:8, maxHeight:200, overflowY:"auto" }}>
+            {alunos.length === 0 ? (
+              <div style={{ fontSize:13, color:"var(--t3)" }}>Nenhum aluno cadastrado.</div>
+            ) : alunos.map(a => {
+              const sel = selecionados.includes(a.id);
+              return (
+                <div key={a.id} onClick={() => toggleAluno(a.id)} style={{ display:"flex", alignItems:"center", gap:12, padding:"10px 14px", borderRadius:10, border:"1.5px solid " + (sel ? "var(--green)" : "var(--b2)"), background: sel ? "var(--s2)" : "var(--s1)", cursor:"pointer" }}>
+                  <div style={{ width:18, height:18, borderRadius:5, border:"2px solid " + (sel ? "var(--green)" : "var(--b2)"), background: sel ? "var(--green)" : "transparent", display:"flex", alignItems:"center", justifyContent:"center", fontSize:11, color:"#07080f", fontWeight:900, flexShrink:0 }}>
+                    {sel && "V"}
+                  </div>
+                  <div style={{ fontSize:13, fontWeight:600, color: sel ? "var(--green)" : "var(--t1)" }}>{a.name}</div>
+                </div>
+              );
+            })}
+          </div>
+          <div style={{ fontSize:11, color:"var(--t3)", marginTop:6 }}>{selecionados.length} aluno(s) selecionado(s)</div>
+        </div>
+
+        <div style={{ display:"flex", gap:10 }}>
+          <button onClick={onClose} style={{ flex:1, padding:"12px", borderRadius:10, border:"1px solid var(--b2)", background:"transparent", color:"var(--t2)", fontSize:13, fontWeight:600, cursor:"pointer" }}>Cancelar</button>
+          <button onClick={criar} style={{ flex:2, padding:"12px", borderRadius:10, border:"none", background:"var(--green)", color:"#07080f", fontSize:13, fontWeight:900, cursor:"pointer", fontFamily:"Cabinet Grotesk" }}>Criar Batalha</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ModalRankingBatalha({ batalhaId, onClose }) {
+  const batalha = batalhasModule.getById(batalhaId);
+  if (!batalha) return null;
+  const sim = simuladosModule.getById(batalha.simuladoId);
+  const questoes = questoesModule.getBySimulado(batalha.simuladoId);
+  const isCE = questoes.every(q => q.tipo === "ce");
+  const ranking = batalhasModule.getRanking(batalhaId);
+  const naoFinalizados = (batalha.participantes || []).filter(p => !p.finalizado);
+
+  const medal = (i) => i === 0 ? "gold" : i === 1 ? "silver" : i === 2 ? "var(--amber)" : "var(--t3)";
+  const medalEmoji = (i) => i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : "#" + (i+1);
+
+  return (
+    <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.85)", display:"flex", alignItems:"flex-start", justifyContent:"center", zIndex:2000, padding:"20px 12px", overflowY:"auto" }}>
+      <div style={{ background:"var(--s1)", borderRadius:14, maxWidth:600, width:"100%", padding:28, margin:"0 auto" }} onClick={e => e.stopPropagation()}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:20 }}>
+          <div>
+            <div style={{ fontSize:11, fontWeight:700, letterSpacing:1, textTransform:"uppercase", color:"var(--t3)", marginBottom:4 }}>Ranking da Batalha</div>
+            <h2 style={{ fontSize:18, fontWeight:900, marginBottom:2 }}>⚔️ {batalha.nome}</h2>
+            <div style={{ fontSize:12, color:"var(--t3)" }}>{sim?.nome} · {isCE ? "Pontuacao Cebraspe + Tradicional" : "Percentual tradicional"}</div>
+          </div>
+          <button onClick={onClose} style={{ padding:"6px 12px", borderRadius:6, border:"none", background:"var(--b2)", color:"var(--t1)", fontSize:13, cursor:"pointer" }}>Fechar</button>
+        </div>
+
+        {ranking.length === 0 ? (
+          <div style={{ padding:24, borderRadius:10, background:"var(--s2)", textAlign:"center", color:"var(--t3)", fontSize:13 }}>
+            Nenhum aluno finalizou ainda.
+          </div>
+        ) : (
+          <div style={{ display:"flex", flexDirection:"column", gap:10, marginBottom:16 }}>
+            {ranking.map((p, i) => {
+              const u = usersModule.getById(p.alunoId);
+              const min = Math.floor(p.tempoGasto / 60);
+              const seg = p.tempoGasto % 60;
+              return (
+                <div key={p.alunoId} style={{ padding:16, borderRadius:12, background: i === 0 ? "rgba(255,215,0,.08)" : "var(--s2)", border:"1.5px solid " + (i === 0 ? "gold" : i === 1 ? "silver" : i === 2 ? "var(--amber)" : "var(--b2)") }}>
+                  <div style={{ display:"flex", alignItems:"center", gap:12, marginBottom:10 }}>
+                    <div style={{ fontSize:22, fontWeight:900, fontFamily:"Cabinet Grotesk", color: medal(i), minWidth:36 }}>{medalEmoji(i)}</div>
+                    <div style={{ flex:1 }}>
+                      <div style={{ fontSize:14, fontWeight:700, color:"var(--t1)" }}>{u?.name || "Aluno"}</div>
+                      <div style={{ fontSize:11, color:"var(--t3)" }}>Tempo: {min}m {seg}s</div>
+                    </div>
+                    <div style={{ textAlign:"right" }}>
+                      <div style={{ fontSize:22, fontWeight:900, fontFamily:"Cabinet Grotesk", color: p.percentual >= 60 ? "var(--green)" : "var(--red)" }}>{p.percentual}%</div>
+                      {isCE && <div style={{ fontSize:11, color:"var(--t3)" }}>Liq: {p.pontosCebraspe} pts</div>}
+                    </div>
+                  </div>
+                  <div style={{ display:"grid", gridTemplateColumns: isCE ? "1fr 1fr 1fr 1fr" : "1fr 1fr 1fr", gap:6 }}>
+                    <div style={{ padding:"6px 8px", borderRadius:6, background:"var(--s3)", textAlign:"center" }}>
+                      <div style={{ fontSize:14, fontWeight:900, color:"var(--green)" }}>{p.acertos}</div>
+                      <div style={{ fontSize:9, color:"var(--t3)", textTransform:"uppercase" }}>Acertos</div>
+                    </div>
+                    <div style={{ padding:"6px 8px", borderRadius:6, background:"var(--s3)", textAlign:"center" }}>
+                      <div style={{ fontSize:14, fontWeight:900, color:"var(--red)" }}>{p.erros}</div>
+                      <div style={{ fontSize:9, color:"var(--t3)", textTransform:"uppercase" }}>Erros</div>
+                    </div>
+                    <div style={{ padding:"6px 8px", borderRadius:6, background:"var(--s3)", textAlign:"center" }}>
+                      <div style={{ fontSize:14, fontWeight:900, color:"var(--t2)" }}>{p.brancos}</div>
+                      <div style={{ fontSize:9, color:"var(--t3)", textTransform:"uppercase" }}>Em branco</div>
+                    </div>
+                    {isCE && (
+                      <div style={{ padding:"6px 8px", borderRadius:6, background:"var(--s3)", textAlign:"center" }}>
+                        <div style={{ fontSize:14, fontWeight:900, color: p.pontosCebraspe >= 0 ? "var(--green)" : "var(--red)" }}>{p.pontosCebraspe}</div>
+                        <div style={{ fontSize:9, color:"var(--t3)", textTransform:"uppercase" }}>Pts Liq.</div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {naoFinalizados.length > 0 && (
+          <div style={{ padding:14, borderRadius:10, background:"var(--s2)", border:"1px solid var(--b2)" }}>
+            <div style={{ fontSize:11, fontWeight:700, color:"var(--t3)", textTransform:"uppercase", marginBottom:8 }}>Aguardando ({naoFinalizados.length})</div>
+            <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+              {naoFinalizados.map(p => {
+                const u = usersModule.getById(p.alunoId);
+                return <span key={p.alunoId} style={{ fontSize:12, padding:"4px 10px", borderRadius:20, background:"var(--s3)", color:"var(--t2)" }}>{u?.name || "?"}</span>;
+              })}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// BATALHA: Area do aluno
+// ============================================================
+function AlunoBatalha({ user, refresh }) {
+  const [tick, setTick] = useState(0);
+  const [resolvendo, setResolvendo] = useState(null); // { batalhaId, tentativaId }
+  const [verRanking, setVerRanking] = useState(null);
+  const batalhas = batalhasModule.getByAluno(user.id);
+
+  function reload() { setTick(t => t+1); refresh && refresh(); }
+
+  const emojis = ["⚔️","🔥","🧠","🏆","💥","🎯","⚡","🥊"];
+  const emoji = (b) => emojis[b.id.charCodeAt(0) % emojis.length];
+
+  if (resolvendo) {
+    return <ResolverBatalha
+      batalhaId={resolvendo.batalhaId}
+      tentativaId={resolvendo.tentativaId}
+      alunoId={user.id}
+      onVoltar={() => { setResolvendo(null); reload(); }}
+    />;
+  }
+
+  return (
+    <div>
+      <div className="ph"><div><h1>⚔️ Batalhas</h1><p>Compita com seus colegas!</p></div></div>
+
+      {batalhas.length === 0 ? (
+        <div className="card"><div className="empty"><h3>Nenhuma batalha disponivel</h3><p>Seu professor ainda nao criou batalhas.</p></div></div>
+      ) : (
+        <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
+          {batalhas.map(b => {
+            const sim = simuladosModule.getById(b.simuladoId);
+            const minha = (b.participantes || []).find(p => p.alunoId === user.id);
+            const total = b.participantes?.length || 0;
+            const finalizados = b.participantes?.filter(p => p.finalizado).length || 0;
+            const ranking = batalhasModule.getRanking(b.id);
+            const minhaPos = minha?.finalizado ? ranking.findIndex(p => p.alunoId === user.id) + 1 : null;
+
+            return (
+              <div key={b.id} style={{ padding:20, borderRadius:12, background:"var(--s1)", border:"1px solid " + (b.status === "ativa" ? "var(--b2)" : "var(--b1)") }}>
+                <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:12 }}>
+                  <div>
+                    <div style={{ fontSize:18, fontWeight:900, fontFamily:"Cabinet Grotesk", marginBottom:4 }}>
+                      {emoji(b)} {b.nome}
+                    </div>
+                    <div style={{ fontSize:12, color:"var(--t3)" }}>
+                      {sim?.nome || "Simulado"} · {finalizados}/{total} finalizaram
+                      {b.dataFim && " · Encerra: " + new Date(b.dataFim+"T00:00:00").toLocaleDateString("pt-BR")}
+                    </div>
+                  </div>
+                  {minha?.finalizado && minhaPos && (
+                    <div style={{ textAlign:"center" }}>
+                      <div style={{ fontSize:26, fontWeight:900, fontFamily:"Cabinet Grotesk", color: minhaPos === 1 ? "gold" : minhaPos === 2 ? "silver" : "var(--amber)" }}>
+                        {minhaPos === 1 ? "🥇" : minhaPos === 2 ? "🥈" : minhaPos === 3 ? "🥉" : "#" + minhaPos}
+                      </div>
+                      <div style={{ fontSize:10, color:"var(--t3)" }}>Sua posicao</div>
+                    </div>
+                  )}
+                </div>
+
+                {minha?.finalizado ? (
+                  <div style={{ marginBottom:12 }}>
+                    <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:8, marginBottom:10 }}>
+                      <div style={{ padding:10, borderRadius:8, background:"var(--green-d)", textAlign:"center" }}>
+                        <div style={{ fontSize:18, fontWeight:900, color:"var(--green)" }}>{minha.acertos}</div>
+                        <div style={{ fontSize:9, color:"var(--green)", textTransform:"uppercase" }}>Acertos</div>
+                      </div>
+                      <div style={{ padding:10, borderRadius:8, background:"rgba(239,68,68,.1)", textAlign:"center" }}>
+                        <div style={{ fontSize:18, fontWeight:900, color:"var(--red)" }}>{minha.erros}</div>
+                        <div style={{ fontSize:9, color:"var(--red)", textTransform:"uppercase" }}>Erros</div>
+                      </div>
+                      <div style={{ padding:10, borderRadius:8, background:"var(--s2)", textAlign:"center" }}>
+                        <div style={{ fontSize:18, fontWeight:900, color:"var(--t2)" }}>{minha.brancos}</div>
+                        <div style={{ fontSize:9, color:"var(--t3)", textTransform:"uppercase" }}>Em branco</div>
+                      </div>
+                    </div>
+                    {minha.pontosCebraspe !== null && (
+                      <div style={{ padding:10, borderRadius:8, background:"var(--s2)", textAlign:"center", marginBottom:8 }}>
+                        <div style={{ fontSize:11, color:"var(--t3)", marginBottom:2 }}>Pontuacao Liquida Cebraspe</div>
+                        <div style={{ fontSize:22, fontWeight:900, fontFamily:"Cabinet Grotesk", color: minha.pontosCebraspe >= 0 ? "var(--green)" : "var(--red)" }}>
+                          {minha.pontosCebraspe > 0 ? "+" : ""}{minha.pontosCebraspe} pontos
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ) : b.status === "ativa" ? (
+                  <div style={{ padding:12, borderRadius:8, background:"var(--s2)", textAlign:"center", marginBottom:12, fontSize:13, color:"var(--t3)" }}>
+                    Voce ainda nao participou desta batalha
+                  </div>
+                ) : (
+                  <div style={{ padding:12, borderRadius:8, background:"var(--s2)", textAlign:"center", marginBottom:12, fontSize:13, color:"var(--t3)" }}>
+                    Batalha encerrada - nao participou
+                  </div>
+                )}
+
+                <div style={{ display:"flex", gap:8 }}>
+                  {!minha?.finalizado && b.status === "ativa" && (
+                    <button
+                      onClick={() => {
+                        const nova = tentativasModule.create(b.simuladoId, user.id);
+                        setResolvendo({ batalhaId: b.id, tentativaId: nova.id });
+                      }}
+                      style={{ flex:2, padding:"10px", borderRadius:10, border:"none", background:"var(--green)", color:"#07080f", fontSize:13, fontWeight:900, cursor:"pointer", fontFamily:"Cabinet Grotesk" }}
+                    >
+                      Entrar na Batalha
+                    </button>
+                  )}
+                  <button onClick={() => setVerRanking(b.id)} style={{ flex:1, padding:"10px", borderRadius:10, border:"none", background:"var(--blue-d)", color:"var(--blue)", fontSize:12, fontWeight:700, cursor:"pointer" }}>
+                    Ver Ranking
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {verRanking && <ModalRankingBatalha batalhaId={verRanking} onClose={() => setVerRanking(null)} />}
+    </div>
+  );
+}
+
+function ResolverBatalha({ batalhaId, tentativaId, alunoId, onVoltar }) {
+  const batalha = batalhasModule.getById(batalhaId);
+  const questoes = batalha ? questoesModule.getBySimulado(batalha.simuladoId) : [];
+  const isCE = questoes.every(q => q.tipo === "ce");
+
+  function handleFinalizar() {
+    tentativasModule.finalizar(tentativaId, 0);
+    const tent = tentativasModule.getById(tentativaId);
+    if (tent) {
+      batalhasModule.registrarResultado(
+        batalhaId, alunoId, tentativaId,
+        tent.acertos || 0, tent.erros || 0, tent.brancos || 0,
+        tent.pontosCebraspe, tent.percentual || 0,
+        tent.tempoDecorridoSegundos || 0
+      );
+    }
+    onVoltar();
+  }
+
+  return (
+    <ResolverSimulado
+      tentativaId={tentativaId}
+      onVoltar={handleFinalizar}
+    />
+  );
+}
+
+
+function GeradorDePrompt() {
+  const [tema, setTema] = useState("");
+  const [modo, setModo] = useState("estudo-padrao");
+  const [promptGerado, setPromptGerado] = useState("");
+  const [copied, setCopied] = useState(false);
+
+  const BASE = "Você é um professor especialista em concursos públicos de alto nível, com foco em provas de Tribunais de Contas, banca CESPE/Cebraspe, e especialista em didática para aprovação.";
+
+  const MODOS = [
+    { id:"estudo-padrao",      icon:"📘", label:"Estudo Padrão",       desc:"Apostila completa com teoria, questões e decoreba" },
+    { id:"revisar-rapido",     icon:"⚡", label:"Revisar Rápido",      desc:"Revisão objetiva para véspera de prova" },
+    { id:"decorar-lei-seca",   icon:"⚖️", label:"Decorar Lei Seca",    desc:"Texto legal mastigado e memorização" },
+    { id:"fazer-questoes",     icon:"❓", label:"Fazer Questões",      desc:"Banco de questões estilo CESPE comentadas" },
+    { id:"treinar-prova",      icon:"🎯", label:"Treinar para Prova",  desc:"Simulação intensiva com gabarito e estratégia" },
+    { id:"tema-dificil",       icon:"🧩", label:"Resolver Tema Difícil",desc:"Explicação do zero com analogias e exemplos" },
+    { id:"resumo-estrategico", icon:"📝", label:"Resumo Estratégico",  desc:"Pontos-chave, pegadinhas e palavras-chave" },
+  ];
+
+  function buildPrompt(t, md) {
+    const P = {
+      "estudo-padrao": BASE + "\n\nSua tarefa é criar um MATERIAL COMPLETO em formato de apostila sobre o tema: " + t + "\n\nSiga EXATAMENTE esta estrutura:\n\n📘 1. VISÃO GERAL DO TEMA\n• Explique o tema de forma simples e objetiva\n• Contextualize para concursos públicos\n• Destaque a importância para provas de controle externo\n\n📚 2. FUNDAMENTAÇÃO TEÓRICA COMPLETA\n• Aborde TODOS os conceitos relevantes com profundidade de prova\n• Inclua: definições formais, classificações, princípios, exceções, pegadinhas\n• Relacione com: Constituição Federal, legislação aplicável e jurisprudência\n\n🧠 3. RESUMO ESTRUTURADO\n• Bullet points objetivos para revisão pré-prova\n• Destaque palavras-chave\n\n⚠️ 4. PRINCIPAIS PEGADINHAS DE PROVA\n• Erros mais comuns e como a banca CESPE costuma cobrar\n\n📝 5. QUESTÕES DE FIXAÇÃO\n• 10 questões nível fácil (múltipla escolha A–E)\n• 10 questões nível médio (múltipla escolha A–E)\n• 5 questões nível difícil (múltipla escolha A–E)\nApresente PRIMEIRO todas sem gabarito, DEPOIS repita com gabarito comentado.\n\n🎯 6. QUESTÕES CERTO/ERRADO (CESPE)\n• 20 assertivas — primeiro todas, depois repita com gabarito comentado\n\n🧩 7. DECOREBA (VÉSPERA DE PROVA)\n• Prazos, números, competências, exceções e classificações para memorizar\n\nRegras: NÃO resuma demais. Seja aprofundado. Use exemplos práticos. Foco total em aprovação.",
+
+      "revisar-rapido": BASE + "\n\nPreciso de uma REVISÃO RÁPIDA e objetiva sobre: " + t + "\n\nOrganize assim:\n\n⚡ 1. CONCEITO EM 3 LINHAS — o essencial que preciso saber\n\n🔑 2. PALAVRAS-CHAVE — termos que a banca usa e que não posso esquecer\n\n🎯 3. O QUE MAIS CAI — top 5 pontos cobrados pela banca CESPE em Tribunais de Contas\n\n⚠️ 4. PEGADINHAS CLÁSSICAS — os erros que derrubam o candidato\n\n⚡ 5. DIFERENÇAS IMPORTANTES — institutos parecidos que a banca confunde\n\n📌 6. QUADRO FINAL DE REVISÃO — resumo em bullet points para ler em 2 minutos\n\nRegras: linguagem telegráfica, objetivo, sem enrolação. Ideal para ler 1 hora antes da prova.",
+
+      "decorar-lei-seca": BASE + "\n\nPreciso decorar a lei seca sobre: " + t + "\n\nTransforme o texto legal em material de memorização:\n\n⚖️ 1. ARTIGOS ESSENCIAIS — transcreva cada um em linguagem simples\n• O que o artigo diz (em palavras normais)\n• O que significa na prática\n• Como a banca pode cobrar esse artigo\n• Pegadinha do texto literal\n• Palavra-chave que precisa ser decorada\n\n📌 2. ESQUEMA DE MEMORIZAÇÃO — organize os artigos em grupos lógicos (ex: prazos, competências, vedações)\n\n🔢 3. NÚMEROS E PRAZOS — tabela com todos os valores numéricos da lei\n\n❌ 4. VEDAÇÕES — o que a lei proíbe expressamente\n\n✅ 5. OBRIGAÇÕES — o que a lei determina expressamente\n\n🃏 6. FICHA PARA COLAR NA CABEÇA — resumo ultra-compacto para memorizar de véspera\n\n📝 7. 15 QUESTÕES CERTO/ERRADO sobre o texto literal, com gabarito comentado",
+
+      "fazer-questoes": BASE + "\n\nCrie um BANCO DE QUESTÕES INTENSIVO sobre: " + t + "\n\nElabore:\n• 10 questões múltipla escolha nível fácil (A–E)\n• 15 questões múltipla escolha nível médio (A–E)\n• 5 questões múltipla escolha nível difícil (A–E)\n• 25 assertivas estilo CERTO/ERRADO (CESPE/Cebraspe)\n\nFoco em:\n• Confundir o candidato como a banca faz\n• Pegadinhas reais de provas de Tribunais de Contas\n• Detalhes que parecem corretos mas estão errados\n\nApresente PRIMEIRO todas as questões SEM gabarito (separadas por nível).\nDepois, repita com GABARITO COMENTADO:\n• Explique cada alternativa (certa e errada)\n• Destaque a pegadinha central\n• Explique por que o candidato erraria",
+
+      "treinar-prova": BASE + "\n\nQuero TREINAR PARA A PROVA com o tema: " + t + "\n\nMonte uma sessão de treino intensivo:\n\n🎯 PARTE 1 — AQUECIMENTO (revisão rápida)\n• Conceito central em até 5 bullet points\n• 3 pegadinhas clássicas do tema\n\n📝 PARTE 2 — SIMULADO (responda sem gabarito primeiro)\n• 10 questões múltipla escolha estilo Tribunais de Contas\n• 15 questões certo/errado estilo CESPE\n• Nível: médio a difícil\n\n🔍 PARTE 3 — GABARITO COMENTADO\n• Explique cada questão em detalhe\n• Para as erradas: mostre onde o candidato se perde\n• Destaque a lógica da banca\n\n🧠 PARTE 4 — PONTOS DE ATENÇÃO\n• O que errei mais nesse tema e por quê\n• Estratégia para não errar na prova real",
+
+      "tema-dificil": BASE + "\n\nPreciso entender do ZERO o tema: " + t + "\n\nTenho muita dificuldade nesse assunto. Por favor:\n\n🌱 1. EXPLICAÇÃO BÁSICA — como se eu nunca tivesse visto\n• Use linguagem simples e acessível\n• Evite jargão técnico no começo\n\n🔗 2. ANALOGIA DO DIA A DIA — compare com algo do cotidiano para facilitar\n\n📶 3. EVOLUÇÃO GRADUAL — agora avance para o nível técnico exigido em prova\n• Introduza os termos corretos\n• Explique o raciocínio jurídico por trás\n\n🔄 4. PASSO A PASSO — como raciocinar sobre esse tema em questões\n• Qual pergunta fazer na minha cabeça ao ver uma questão desse tema\n\n⚠️ 5. POR QUE AS PESSOAS ERRAM — pontos que geram mais confusão\n\n✅ 6. EXEMPLOS PRÁTICOS — situações reais ou hipotéticas\n\n📝 7. QUESTÕES COMENTADAS — 8 questões do básico ao avançado com explicação detalhada\n\nRegras: Seja didático acima de tudo. Não pule etapas. Use exemplos. Foco em clareza.",
+
+      "resumo-estrategico": BASE + "\n\nCrie um RESUMO ESTRATÉGICO de alta qualidade sobre: " + t + "\n\nEstrutura obrigatória:\n\n📌 1. CONCEITO CENTRAL — definição precisa e contextualização para concursos\n\n🎯 2. O QUE MAIS CAI EM PROVA — top 7 pontos cobrados pela banca CESPE em Tribunais de Contas\n\n🔑 3. PALAVRAS-CHAVE — termos que a banca usa e que precisam ser decorados\n\n⚖️ 4. BASE LEGAL — CF, lei e jurisprudência relevante para cada ponto\n\n🔀 5. DIFERENÇAS E COMPARAÇÕES — institutos parecidos e como distingui-los\n\n⚠️ 6. PRINCIPAIS PEGADINHAS — erros mais comuns com explicação de por que são pegadinhas\n\n📊 7. QUADRO COMPARATIVO (se aplicável) — tabela para visualizar diferenças\n\n⚡ 8. REVISÃO RÁPIDA FINAL — bullet points para ler em 3 minutos antes da prova\n\nRegras: Linguagem objetiva. Destaque o que mais cai. Nada de enrolação. Escreva como material de véspera.",
+    };
+    return P[md] || "";
+  }
+
+  function handleGerar() {
+    if (!tema.trim()) return;
+    setPromptGerado(buildPrompt(tema.trim(), modo));
+    setCopied(false);
+    setTimeout(() => { const el = document.getElementById("gp-output"); if (el) el.scrollIntoView({ behavior:"smooth", block:"start" }); }, 150);
+  }
+
+  function handleCopiar() {
+    navigator.clipboard.writeText(promptGerado).then(() => { setCopied(true); setTimeout(() => setCopied(false), 2500); });
+  }
+
+  function handleDownload() {
+    const blob = new Blob([promptGerado], { type:"text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "prompt-" + tema.trim().replace(/\s+/g,"-").toLowerCase().substring(0,40) + ".txt";
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  return (
+    <div style={{ maxWidth:800, margin:"0 auto", padding:"32px 24px" }}>
+      <div style={{ marginBottom:32 }}>
+        <h1 style={{ fontSize:26, fontWeight:900, fontFamily:"Cabinet Grotesk", marginBottom:8 }}>🧠 Gerador Inteligente de Prompts para Concursos</h1>
+        <p style={{ color:"var(--t2)", fontSize:15, margin:0 }}>Crie prompts premium para estudar qualquer assunto com IA.</p>
+      </div>
+
+      <div style={{ marginBottom:24 }}>
+        <label style={{ fontSize:11, fontWeight:700, letterSpacing:.6, textTransform:"uppercase", color:"var(--t3)", display:"block", marginBottom:8 }}>📖 Tema da aula / assunto</label>
+        <input className="inp" value={tema} onChange={e=>setTema(e.target.value)} onKeyDown={e=>e.key==="Enter"&&handleGerar()} placeholder="Ex: Controle de Constitucionalidade · Licitações Lei 14.133 · Auditoria Governamental · Ato Administrativo" style={{ fontSize:15, padding:"14px 16px" }}/>
+      </div>
+
+      <div style={{ marginBottom:28 }}>
+        <label style={{ fontSize:11, fontWeight:700, letterSpacing:.6, textTransform:"uppercase", color:"var(--t3)", display:"block", marginBottom:12 }}>O que você quer fazer?</label>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(220px, 1fr))", gap:10 }}>
+          {MODOS.map(m=>(
+            <label key={m.id} style={{ display:"flex", alignItems:"flex-start", gap:12, padding:"14px", borderRadius:10, background:modo===m.id?"var(--green-d)":"var(--s2)", border:"1.5px solid "+(modo===m.id?"var(--green)":"var(--b2)"), cursor:"pointer", transition:"all .15s" }}>
+              <input type="radio" name="modo" checked={modo===m.id} onChange={()=>setModo(m.id)} style={{ accentColor:"var(--green)", flexShrink:0, marginTop:2 }}/>
+              <div>
+                <div style={{ fontSize:13, fontWeight:700 }}>{m.icon} {m.label}</div>
+                <div style={{ fontSize:11, color:"var(--t3)", marginTop:2 }}>{m.desc}</div>
+              </div>
+            </label>
+          ))}
+        </div>
+      </div>
+
+      <button onClick={handleGerar} disabled={!tema.trim()} style={{ width:"100%", padding:"16px", borderRadius:10, border:"none", cursor:tema.trim()?"pointer":"not-allowed", background:tema.trim()?"var(--green)":"var(--s3)", color:tema.trim()?"#07080f":"var(--t3)", fontSize:17, fontWeight:900, fontFamily:"Cabinet Grotesk", transition:"all .18s", marginBottom:8 }}>🚀 Gerar Prompt</button>
+
+      {promptGerado&&(
+        <div id="gp-output" style={{ marginTop:24 }}>
+          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:12, flexWrap:"wrap", gap:8 }}>
+            <div style={{ fontSize:13, fontWeight:700, letterSpacing:.6, textTransform:"uppercase", color:"var(--green)" }}>✅ Prompt Gerado</div>
+            <div style={{ display:"flex", gap:8, flexWrap:"wrap" }}>
+              <button onClick={handleCopiar} style={{ padding:"8px 16px", borderRadius:8, border:"1px solid "+(copied?"var(--green)":"var(--b2)"), background:copied?"var(--green-d)":"var(--s2)", color:copied?"var(--green)":"var(--t1)", fontSize:12, fontWeight:600, cursor:"pointer" }}>{copied?"✅ Copiado!":"📋 Copiar"}</button>
+              <button onClick={handleDownload} style={{ padding:"8px 16px", borderRadius:8, border:"1px solid var(--b2)", background:"var(--s2)", color:"var(--t1)", fontSize:12, fontWeight:600, cursor:"pointer" }}>💾 Baixar .txt</button>
+              <button onClick={()=>window.open("https://chat.openai.com","_blank")} style={{ padding:"8px 16px", borderRadius:8, border:"none", background:"#10a37f", color:"#fff", fontSize:12, fontWeight:600, cursor:"pointer" }}>🤖 ChatGPT</button>
+              <button onClick={()=>window.open("https://claude.ai","_blank")} style={{ padding:"8px 16px", borderRadius:8, border:"none", background:"#c9622a", color:"#fff", fontSize:12, fontWeight:600, cursor:"pointer" }}>✴ Claude</button>
+            </div>
+          </div>
+          <textarea readOnly value={promptGerado} onClick={e=>e.target.select()} style={{ width:"100%", minHeight:380, padding:"20px", borderRadius:12, boxSizing:"border-box", background:"var(--s1)", border:"1.5px solid var(--green)", color:"var(--t1)", fontSize:13, lineHeight:1.75, fontFamily:"inherit", resize:"vertical", outline:"none", boxShadow:"0 0 0 4px rgba(34,211,165,0.07)" }}/>
+          <div style={{ marginTop:8, fontSize:11, color:"var(--t3)", textAlign:"right" }}>💡 Clique na caixa para selecionar tudo · {promptGerado.length} caracteres</div>
         </div>
       )}
     </div>
@@ -6074,7 +7908,7 @@ function CoachRanking({ user }) {
 }
 
 // ============================================================
-// ROOT
+// APP ROOT
 // ============================================================
 export default function App() {
   const [user, setUser] = useState(null);
@@ -6086,7 +7920,6 @@ export default function App() {
   useEffect(() => {
     storage.load().then(() => {
       setDbLoaded(true);
-      // Restore session from localStorage
       try {
         const savedId = localStorage.getItem('estudaai_session');
         if (savedId) {
@@ -6110,9 +7943,8 @@ export default function App() {
     <>
       <style dangerouslySetInnerHTML={{ __html: css }} />
       <div style={{ display:"flex", alignItems:"center", justifyContent:"center", minHeight:"100vh", background:"var(--bg)", flexDirection:"column", gap:"16px" }}>
-        <div style={{ fontSize:"40px" }}>📚</div>
-        <div style={{ color:"var(--green)", fontFamily:"Cabinet Grotesk", fontWeight:900, fontSize:"22px", letterSpacing:"-0.5px" }}>EstudaAI</div>
-        <div style={{ color:"var(--t3)", fontSize:"13px" }}>Conectando ao banco de dados...</div>
+        <div style={{ width:40, height:40, border:"3px solid var(--b2)", borderTop:"3px solid var(--blue)", borderRadius:"50%", animation:"spin 0.8s linear infinite" }}/>
+        <div style={{ fontSize:13, color:"var(--t3)" }}>Carregando...</div>
       </div>
     </>
   );
@@ -6126,31 +7958,35 @@ export default function App() {
 
   function renderPage() {
     if (user.role === "admin") {
-      if (page==="dashboard") return <AdminDashboard refresh={refresh}/>;
-      if (page==="coaches")   return <AdminCoaches   refresh={refresh}/>;
-      if (page==="alunos")    return <AdminAlunos    refresh={refresh}/>;
-      if (page==="logs")      return <AdminLogs/>;
-      if (page==="debug")     return <AdminDebug/>;
+      if (page === "dashboard") return <AdminDashboard refresh={refresh}/>;
+      if (page === "coaches")   return <AdminCoaches   refresh={refresh}/>;
+      if (page === "alunos")    return <AdminAlunos    refresh={refresh}/>;
+      if (page === "logs")      return <AdminLogs/>;
+      if (page === "debug")     return <AdminDebug/>;
     }
     if (user.role === "coach") {
-      if (page==="dashboard")      return <CoachDashboard user={user} refresh={refresh}/>;
-      if (page==="alunos")         return <CoachAlunos    user={user} refresh={refresh}/>;
-      if (page==="editais")        return <CoachEditais   user={user} refresh={refresh}/>;
-      if (page==="gerenciar-plano") return <CoachGerenciarPlanos user={user} refresh={refresh}/>;
-      if (page==="progresso")      return <CoachProgresso user={user}/>;
-      if (page==="conteudo")       return <CoachConteudo user={user} refresh={refresh}/>;
-      if (page==="resumos")        return <CoachResumos user={user} refresh={refresh}/>;
-      if (page==="simulados")      return <CoachSimulados user={user} refresh={refresh}/>;
-      if (page==="ranking")        return <CoachRanking   user={user}/>;
+      if (page === "dashboard")       return <CoachDashboard       user={user} refresh={refresh}/>;
+      if (page === "alunos")          return <CoachAlunos          user={user} refresh={refresh}/>;
+      if (page === "editais")         return <CoachEditais         user={user} refresh={refresh}/>;
+      if (page === "gerenciar-plano") return <CoachGerenciarPlanos user={user} refresh={refresh}/>;
+      if (page === "progresso")       return <CoachProgresso       user={user}/>;
+      if (page === "conteudo")        return <CoachConteudo        user={user} refresh={refresh}/>;
+      if (page === "resumos")         return <CoachResumos         user={user} refresh={refresh}/>;
+      if (page === "simulados")       return <CoachSimulados       user={user} refresh={refresh}/>;
+      if (page === "ranking")         return <CoachRanking         user={user}/>;
+      if (page === "gerador-prompt")  return <GeradorDePrompt/>;
+      if (page === "batalha")         return <CoachBatalha user={user} refresh={refresh}/>;
     }
     if (user.role === "aluno") {
-      if (page==="dashboard") return <AlunoDashboard user={user} refresh={refresh} setPage={setPage}/>;
-      if (page==="plano")     return <AlunoPlano     user={user} refresh={refresh}/>;
-      if (page==="rotina")    return <AlunoRotina    user={user} refresh={refresh}/>;
-      if (page==="progresso") return <AlunoProgresso user={user}/>;
-      if (page==="conteudos") return <AlunoConteudos user={user}/>;
-      if (page==="simulados") return <AlunoSimulados user={user} refresh={refresh}/>;
-      if (page==="ranking")   return <AlunoRanking   user={user}/>;
+      if (page === "dashboard") return <AlunoDashboard user={user} refresh={refresh} setPage={setPage}/>;
+      if (page === "plano")     return <AlunoPlano     user={user} refresh={refresh}/>;
+      if (page === "rotina")    return <AlunoRotina    user={user} refresh={refresh}/>;
+      if (page === "progresso") return <AlunoProgresso user={user}/>;
+      if (page === "conteudos") return <AlunoConteudos user={user}/>;
+      if (page === "simulados") return <AlunoSimulados user={user} refresh={refresh}/>;
+      if (page === "ranking")   return <AlunoRanking   user={user}/>;
+      if (page === "gerador-prompt") return <GeradorDePrompt/>;
+      if (page === "batalha")   return <AlunoBatalha user={user} refresh={refresh}/>;
     }
     return null;
   }
@@ -6163,4 +7999,4 @@ export default function App() {
       </Layout>
     </>
   );
-}                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          
+}
