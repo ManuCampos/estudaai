@@ -1,55 +1,36 @@
-# 📚 EstudaAI - Sistema de Gestão de Estudos
+# EstudaAI 📚
 
-Plataforma inteligente de gerenciamento de planos de estudos com revisões espaçadas, controle de progresso e suporte a múltiplos editais.
+Sistema de Gestão de Estudos com revisões espaçadas.
 
-## 🎯 Funcionalidades
+## Perfis
 
-- **👨‍🏫 Gerenciamento de Planos** - Coaches criam planos personalizados
-- **📖 Três Níveis de Cobertura** - Alta, Média e Baixa cobertura
-- **🔄 Revisões Inteligentes** - Algoritmo de espaçamento com 3 estratégias
-- **🔀 Migração de Editais** - Transferir alunos entre editais preservando progresso
-- **📝 Simulados com Resultados** - Coaches gerenciam simulados e veem detalhes
-- **📊 Acompanhamento de Progresso** - Histórico completo de estudos
+| Perfil | E-mail | Senha |
+|--------|--------|-------|
+| Admin  | admin@estudaai.com  | admin123  |
+| Coach  | carlos@estudaai.com | coach123  |
+| Aluno  | ana@estudaai.com    | aluno123  |
 
-## 🚀 Quick Start
+## Funcionalidades
+
+- **Admin** — gerencia coaches, alunos, logs e resets de senha
+- **Coach** — cria editais, matérias, tópicos e acompanha progresso dos alunos
+- **Aluno** — gera plano de estudos, configura rotina e acompanha progresso
+
+## Tecnologias
+
+- React 18 + Vite 5
+- Revisões espaçadas automáticas (1, 3, 7, 14, 30 dias)
+- Arquitetura modular: auth / users / editais / planos / progresso
+
+## Deploy
+
+Hospedado no Vercel — push na branch `main` faz deploy automático.
+
+## Desenvolvimento local
 
 ```bash
-# Instalar dependências
 npm install
-
-# Rodar em desenvolvimento
 npm run dev
-
-# Build para produção
-npm run build
 ```
 
-## 🔐 Credenciais de Teste
-
-**Admin:**
-- Email: `admin@estudaai.com`
-- Senha: `admin123`
-
-**Coach:**
-- Email: `carlos@estudaai.com`
-- Senha: `coach123`
-
-**Aluno:**
-- Email: `ana@estudaai.com`
-- Senha: `aluno123`
-
-## 🏗️ Arquitetura
-
-- **Frontend:** React 18 + Vite
-- **Backend:** Supabase (PostgreSQL)
-- **Deploy:** Vercel
-
-## 📱 Perfis de Usuário
-
-- **Admin** - Gerencia admins e coaches
-- **Coach** - Cria editais, tópicos e planos para alunos
-- **Aluno** - Estuda segundo plano gerado
-
----
-
-Desenvolvido com ❤️ para EstudaAI
+Abra http://localhost:5173

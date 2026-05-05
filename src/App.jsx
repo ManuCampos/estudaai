@@ -528,6 +528,49 @@ const progressoModule = {
   getNote(alunoId, planoId, topicId) {
     return (storage.get().studyNotes || []).find(n => n.alunoId === alunoId && n.planoId === planoId && n.topicId === topicId)?.note || "";
   },
+  deleteNote(alunoId, planoId, topicId) {
+    storage.set(db => ({
+      ...db,
+      studyNotes: (db.studyNotes || []).filter(n =>
+        !(n.alunoId === alunoId && n.planoId === planoId && n.topicId === topicId)
+      ),
+    }));
+  },
+  // Lista todos os resumos do aluno, enriquecidos com topic+matéria+plano.
+  // Retorna [{ alunoId, planoId, topicId, note, updatedAt, topic:{id,name}, materia:{id,name,color}, planoNome }]
+  listResumos(alunoId) {
+    const db = storage.get();
+    const notes = (db.studyNotes || []).filter(n => n.alunoId === alunoId && (n.note || "").trim().length > 0);
+    return notes.map(n => {
+      const plano = (db.planos || []).find(p => p.id === n.planoId);
+      const edital = plano ? (db.editais || []).find(e => e.id === plano.editalId) : null;
+      let topic = null, materia = null;
+      if (edital) {
+        for (const m of (edital.materias || [])) {
+          const t = (m.topicos || []).find(t => t.id === n.topicId);
+          if (t) { topic = t; materia = m; break; }
+        }
+      }
+      // Fallback: tenta achar via plano.plan.topicos
+      if (!topic && plano) {
+        for (const day of Object.values(plano.plan || {})) {
+          const t = (day.topicos || []).find(t => t.id === n.topicId);
+          if (t) {
+            topic = { id: t.id, name: t.name };
+            materia = { id: t.materiaId, name: t.materiaName, color: t.materiaColor };
+            break;
+          }
+        }
+      }
+      return {
+        alunoId: n.alunoId, planoId: n.planoId, topicId: n.topicId,
+        note: n.note, updatedAt: n.updatedAt,
+        topic: topic || { id: n.topicId, name: "Tópico removido" },
+        materia: materia || { id: "?", name: "Sem matéria", color: "#6b7280" },
+        planoNome: edital?.name || plano?.id || "—",
+      };
+    });
+  },
   getStats(alunoId, planoId) {
     const plano = planosModule.getById(planoId);
     if (!plano) return null;
@@ -637,15 +680,53 @@ const gamificacaoModule = {
     const prog = storage.get().progresso.filter(
       p => p.alunoId === alunoId && p.planoId === planoId && p.done && !p.key.endsWith("-rev")
     );
-    const days = [...new Set(prog.map(p => p.key.split("-").slice(0,3).join("-")))].sort().reverse();
-    if (!days.length) return 0;
+    const doneDays = new Set(prog.map(p => p.key.split("-").slice(0,3).join("-")));
+    if (!doneDays.size) return 0;
+
+    // Determina os dias de estudo da rotina (DOW: 0=domingo .. 6=sábado).
+    // Dias NÃO marcados como estudo + feriados nacionais são "puláveis":
+    // não estudar neles não quebra o streak.
+    const plano = (storage.get().planos || []).find(p => p.id === planoId);
+    const diasConfig = plano?.rotina?.diasConfig || null;
+    const diasEstudo = plano?.rotina?.dias || [1,2,3,4,5];
+    const isStudyDow = (dow) => {
+      if (diasConfig) return (diasConfig[dow] || 0) > 0;
+      return diasEstudo.includes(dow);
+    };
+    const isStudyDate = (d) => isStudyDow(d.getDay()) && !isFeriadoBR(d);
+
     const today = new Date(); today.setHours(0,0,0,0);
+    let cursor = new Date(today);
+
+    // Se hoje ainda não é dia de estudo (fim de semana / feriado / dia sem aula),
+    // recua até o último dia de estudo. Caso contrário, se hoje é dia de estudo
+    // mas nada foi feito ainda, considera como "ainda em curso" e recua para o
+    // último dia de estudo anterior — assim o streak não cai à meia-noite.
+    if (!isStudyDate(cursor) || !doneDays.has(localDateKey(cursor))) {
+      // recua um dia e procura o último dia de estudo
+      let safety = 0;
+      do {
+        cursor.setDate(cursor.getDate() - 1); safety++;
+      } while (!isStudyDate(cursor) && safety < 60);
+    }
+
     let streak = 0;
-    let expected = new Date(today);
-    for (const dk of days) {
-      const expKey = localDateKey(expected);
-      if (dk === expKey) { streak++; expected.setDate(expected.getDate() - 1); }
-      else if (dk < expKey) break;
+    let safety = 0;
+    while (safety < 365 * 3) {
+      safety++;
+      if (!isStudyDate(cursor)) {
+        // Pula dia sem estudo (fim de semana / feriado / dia 0-aulas) —
+        // não conta nem quebra a sequência.
+        cursor.setDate(cursor.getDate() - 1);
+        continue;
+      }
+      const k = localDateKey(cursor);
+      if (doneDays.has(k)) {
+        streak++;
+        cursor.setDate(cursor.getDate() - 1);
+      } else {
+        break; // dia de estudo SEM aula concluída → fim do streak
+      }
     }
     return streak;
   },
@@ -1157,6 +1238,39 @@ planosModule.regenerarFuturo = function(planoId, alunoId, novaRotina) {
     });
   });
 
+  // Re-aplica o cap de revisões POR DIA agora que adicionamos as revisões
+  // das aulas já concluídas (esse passo originalmente ignorava o cap).
+  if (maxRevDay > 0) {
+    let safetyCap = 0;
+    while (safetyCap < 10) {
+      safetyCap++;
+      let changed = false;
+      const keysSorted = Object.keys(plan).sort();
+      for (let i = 0; i < keysSorted.length; i++) {
+        const dk = keysSorted[i];
+        const day = plan[dk];
+        if (!day.reviews || day.reviews.length <= maxRevDay) continue;
+        const overflow = day.reviews.splice(maxRevDay);
+        changed = true;
+        let j = i + 1;
+        while (j < keysSorted.length && aulasNoDia(new Date(keysSorted[j]+"T12:00:00").getDay()) === 0) j++;
+        if (j < keysSorted.length) {
+          plan[keysSorted[j]].reviews = [...overflow, ...plan[keysSorted[j]].reviews];
+        } else {
+          const lastDate = new Date(keysSorted[keysSorted.length-1]+"T12:00:00");
+          let extDate = new Date(lastDate); extDate.setDate(extDate.getDate()+1);
+          let s3 = 0;
+          while (aulasNoDia(extDate.getDay()) === 0 && s3 < 30) { extDate.setDate(extDate.getDate()+1); s3++; }
+          const extKey = localDateKey(extDate);
+          if (!plan[extKey]) plan[extKey] = { date: extKey, topicos: [], reviews: [] };
+          plan[extKey].reviews.push(...overflow);
+          keysSorted.push(extKey);
+        }
+      }
+      if (!changed) break;
+    }
+  }
+
   // Preserva os dias passados para que o histórico de semanas anteriores continue visível
   const pastPlan = {};
   Object.entries(plano.plan || {}).forEach(([key, day]) => {
@@ -1224,6 +1338,267 @@ planosModule.reagendarTopico = function(planoId, dateKey, topicoId) {
     });
     return { ...db, planos };
   });
+};
+
+// ============================================================
+// REMANEJAMENTO AUTOMÁTICO — aulas e revisões pendentes em dias
+// passados são movidas para o próximo dia útil.
+//
+// Disparada automaticamente:
+//   • Ao carregar o app (qualquer hora)        → cutoff = hoje
+//   • Diariamente às 23:59:30 (timer interno)  → cutoff = amanhã
+//
+// Comportamento:
+//   • Para cada aula NÃO concluída em dias < cutoff:
+//       – Remove do dia antigo
+//       – Reagenda para o próximo dia útil (respeita capacidade
+//         aulasPorDia/diasConfig e feriados nacionais BR)
+//       – Recria as revisões a partir da nova data (REVIEW_PRESETS)
+//   • Para cada revisão NÃO concluída em dias < cutoff:
+//       – Se o tópico-pai foi remanejado, ignora (a revisão já foi
+//         recriada junto com a aula)
+//       – Caso contrário, move para o próximo dia útil
+//   • Aulas e revisões já marcadas como concluídas permanecem no
+//     dia original (preserva o histórico real de estudo).
+// ============================================================
+planosModule.remanejarPendentesPassados = function(cutoffDateKeyParam) {
+  const todayKey = localDateKey();
+  const cutoffKey = cutoffDateKeyParam || todayKey;
+  const cutoffDate = new Date(cutoffKey + "T12:00:00");
+  const db = storage.get();
+  const planos = db.planos || [];
+  if (planos.length === 0) return { aulas: 0, revisoes: 0 };
+
+  // Conjunto de chaves "aluno|plano|key" feitas (done=true)
+  const progressoSet = new Set(
+    (db.progresso || [])
+      .filter(p => p.done)
+      .map(p => `${p.alunoId}|${p.planoId}|${p.key}`)
+  );
+
+  let totalAulasMovidas = 0;
+  let totalRevisoesMovidas = 0;
+  let mudou = false;
+
+  const planosAtualizados = planos.map(plano => {
+    const diasConfig = plano.rotina?.diasConfig || null;
+    const aulasPorDia = plano.rotina?.aulasPorDia || 1;
+    const diasEstudo = plano.rotina?.dias || [1, 2, 3, 4, 5];
+    const aulasNoDia = (dow) => {
+      if (diasConfig) return diasConfig[dow] || 0;
+      return diasEstudo.includes(dow) ? aulasPorDia : 0;
+    };
+    const proxDiaUtilLocal = (fromDate) => {
+      let d = new Date(fromDate);
+      let safety = 0;
+      while ((aulasNoDia(d.getDay()) === 0 || isFeriadoBR(d)) && safety < 60) {
+        d.setDate(d.getDate() + 1); safety++;
+      }
+      return d;
+    };
+
+    const np = JSON.parse(JSON.stringify(plano.plan || {}));
+    const allKeys = Object.keys(np).sort();
+    const pastKeys = allKeys.filter(dk => dk < cutoffKey);
+    if (pastKeys.length === 0) return plano;
+
+    // 1) Coleta aulas e revisões pendentes; mantém apenas as feitas no dia antigo
+    const aulasPendentes = [];   // { topico, oldKey }
+    const revisoesPendentes = []; // { review, oldKey }
+
+    pastKeys.forEach(dk => {
+      const day = np[dk];
+      if (!day) return;
+      const planoKey = `${plano.alunoId}|${plano.id}`;
+      const topicosFeitos = [];
+      const topicosPend = [];
+      (day.topicos || []).forEach(t => {
+        const k = `${planoKey}|${dk}-${t.id}`;
+        if (progressoSet.has(k)) topicosFeitos.push(t);
+        else topicosPend.push(t);
+      });
+      const revsFeitas = [];
+      const revsPend = [];
+      (day.reviews || []).forEach(r => {
+        const k = `${planoKey}|${dk}-${r.id}-rev`;
+        if (progressoSet.has(k)) revsFeitas.push(r);
+        else revsPend.push(r);
+      });
+      topicosPend.forEach(t => aulasPendentes.push({ topico: t, oldKey: dk }));
+      revsPend.forEach(r => revisoesPendentes.push({ review: r, oldKey: dk }));
+      np[dk] = { ...day, topicos: topicosFeitos, reviews: revsFeitas };
+    });
+
+    if (aulasPendentes.length === 0 && revisoesPendentes.length === 0) return plano;
+
+    const ensureDay = (key) => {
+      if (!np[key]) np[key] = { date: key, topicos: [], reviews: [] };
+    };
+
+    // 2) Move aulas pendentes em ordem cronológica, respeitando aulasPorDia
+    aulasPendentes.sort((a, b) => a.oldKey.localeCompare(b.oldKey));
+    let cursorDate = proxDiaUtilLocal(new Date(cutoffDate));
+    const movingTopicIds = new Set();
+
+    aulasPendentes.forEach(({ topico }) => {
+      let safety = 0;
+      while (safety < 120) {
+        const dow = cursorDate.getDay();
+        if (aulasNoDia(dow) === 0 || isFeriadoBR(cursorDate)) {
+          cursorDate.setDate(cursorDate.getDate() + 1); safety++; continue;
+        }
+        const cKey = localDateKey(cursorDate);
+        ensureDay(cKey);
+        const ocupadas = (np[cKey].topicos || []).length;
+        if (ocupadas < aulasNoDia(dow)) {
+          // Antes de adicionar, remove revisões PENDENTES futuras desse mesmo tópico
+          // (serão recriadas a partir da nova data). Revisões já feitas são preservadas.
+          Object.keys(np).forEach(dk => {
+            if (dk >= cKey) {
+              np[dk].reviews = (np[dk].reviews || []).filter(r => {
+                if (r.id !== topico.id) return true;
+                const rk = `${plano.alunoId}|${plano.id}|${dk}-${r.id}-rev`;
+                return progressoSet.has(rk); // mantém só as feitas
+              });
+            }
+          });
+          np[cKey].topicos = [...(np[cKey].topicos || []), topico];
+          movingTopicIds.add(topico.id);
+          // Recria as revisões a partir da nova data (preset da matéria)
+          const intervals = REVIEW_PRESETS[topico.materiaReviewPreset || "moderada"] || REVIEW_INTERVALS;
+          intervals.forEach(interval => {
+            let rd = new Date(cursorDate); rd.setDate(rd.getDate() + interval);
+            rd = proxDiaUtilLocal(rd);
+            const rk = localDateKey(rd);
+            ensureDay(rk);
+            if (!np[rk].reviews.find(r => r.id === topico.id && r.reviewInterval === interval)) {
+              np[rk].reviews = [...np[rk].reviews, { ...topico, reviewInterval: interval }];
+            }
+          });
+          totalAulasMovidas++;
+          mudou = true;
+          break;
+        }
+        cursorDate.setDate(cursorDate.getDate() + 1); safety++;
+      }
+    });
+
+    // 3) Move revisões pendentes que NÃO são de aulas remanejadas.
+    //    Respeita maxRevisoesPorDia transbordando para o próximo dia útil.
+    const maxRevDay = plano.rotina?.maxRevisoesPorDia || 0;
+    let revCursorDate = proxDiaUtilLocal(new Date(cutoffDate));
+    const proximoDiaComEspaco = (fromDate) => {
+      let d = new Date(fromDate);
+      let safety = 0;
+      while (safety < 365) {
+        if (aulasNoDia(d.getDay()) > 0 && !isFeriadoBR(d)) {
+          const k = localDateKey(d);
+          ensureDay(k);
+          if (maxRevDay <= 0 || (np[k].reviews || []).length < maxRevDay) return d;
+        }
+        d.setDate(d.getDate() + 1); safety++;
+      }
+      return d;
+    };
+    revisoesPendentes.forEach(({ review }) => {
+      if (movingTopicIds.has(review.id)) return; // já recriadas com a aula
+      revCursorDate = proximoDiaComEspaco(revCursorDate);
+      const rk = localDateKey(revCursorDate);
+      ensureDay(rk);
+      const ja = np[rk].reviews.find(r => r.id === review.id && r.reviewInterval === review.reviewInterval);
+      if (!ja) {
+        np[rk].reviews = [...np[rk].reviews, review];
+        totalRevisoesMovidas++;
+        mudou = true;
+      }
+    });
+
+    // 4) Cap reviews per day em cascata — após mover aulas (que recriam revisões)
+    //    e revisões pendentes, garante que nenhum dia ultrapasse maxRevisoesPorDia.
+    if (maxRevDay > 0) {
+      let safetyCap = 0;
+      while (safetyCap < 10) {
+        safetyCap++;
+        let changed = false;
+        const keysSorted = Object.keys(np).sort();
+        for (let i = 0; i < keysSorted.length; i++) {
+          const dk = keysSorted[i];
+          const day = np[dk];
+          if (!day.reviews || day.reviews.length <= maxRevDay) continue;
+          const overflow = day.reviews.splice(maxRevDay);
+          changed = true;
+          mudou = true;
+          let j = i + 1;
+          let placed = false;
+          while (j < keysSorted.length) {
+            const nk = keysSorted[j];
+            const nd = new Date(nk + "T12:00:00");
+            if (aulasNoDia(nd.getDay()) > 0 && !isFeriadoBR(nd)) {
+              np[nk].reviews = [...overflow, ...np[nk].reviews];
+              placed = true; break;
+            }
+            j++;
+          }
+          if (!placed) {
+            const lastKey = keysSorted[keysSorted.length - 1];
+            let extDate = new Date(lastKey + "T12:00:00");
+            let s2 = 0;
+            do { extDate.setDate(extDate.getDate() + 1); s2++; }
+            while ((aulasNoDia(extDate.getDay()) === 0 || isFeriadoBR(extDate)) && s2 < 30);
+            const ek = localDateKey(extDate);
+            ensureDay(ek);
+            np[ek].reviews = [...overflow, ...np[ek].reviews];
+            keysSorted.push(ek);
+          }
+        }
+        if (!changed) break;
+      }
+    }
+
+    return { ...plano, plan: np };
+  });
+
+  if (mudou) {
+    storage.set(db => ({ ...db, planos: planosAtualizados }));
+    if (typeof console !== "undefined") {
+      console.log(`[EstudaAI] Remanejamento automático: ${totalAulasMovidas} aula(s) e ${totalRevisoesMovidas} revisão(ões) movidas para o próximo dia útil.`);
+    }
+  }
+  return { aulas: totalAulasMovidas, revisoes: totalRevisoesMovidas };
+};
+
+// Agendador interno: roda no carregamento do app + diariamente às 23:59:30.
+// Idempotente: pode ser chamado várias vezes; só haverá um timer ativo.
+let _remanejarTimer = null;
+planosModule.iniciarRemanejamentoAutomatico = function() {
+  if (typeof window === "undefined") return;
+  // 1) Execução imediata (cutoff = hoje → move dias passados)
+  try { planosModule.remanejarPendentesPassados(); } catch (e) {
+    console.warn("[EstudaAI] Erro no remanejamento inicial:", e);
+  }
+  // 2) Agendamento recursivo às 23:59:30 (cutoff = amanhã → move TODAS as
+  //    aulas/revisões não estudadas no dia que está terminando).
+  const agendar = () => {
+    const agora = new Date();
+    const alvo = new Date(agora);
+    alvo.setHours(23, 59, 30, 0);
+    if (alvo.getTime() <= agora.getTime()) alvo.setDate(alvo.getDate() + 1);
+    const ms = alvo.getTime() - agora.getTime();
+    if (_remanejarTimer) clearTimeout(_remanejarTimer);
+    _remanejarTimer = setTimeout(() => {
+      try {
+        // Cutoff = amanhã: ao rodar às 23:59:30 de hoje, marca o dia atual
+        // como "passado", movendo todas as aulas/revisões pendentes dele.
+        const amanha = new Date();
+        amanha.setDate(amanha.getDate() + 1);
+        planosModule.remanejarPendentesPassados(localDateKey(amanha));
+      } catch (e) {
+        console.warn("[EstudaAI] Erro no remanejamento agendado:", e);
+      }
+      agendar(); // re-agenda para o próximo dia
+    }, ms);
+  };
+  agendar();
 };
 
 // Importa uma aula já estudada: marca como concluída em data passada e adiciona revisões futuras
@@ -2537,6 +2912,7 @@ const NAV = {
     { id: "plano",     label: "Meu Plano",       icon: "📅" },
     { id: "rotina",    label: "Rotina",           icon: "⚙️" },
     { id: "progresso", label: "Progresso",        icon: "📊" },
+    { id: "resumos",   label: "Resumos",          icon: "✍️" },
     { id: "conteudos", label: "Conteúdos",       icon: "📚" },
     { id: "simulados", label: "Simulados",       icon: "📝" },
     { id: "ranking",         label: "Ranking",          icon: "🏆" },
@@ -4247,18 +4623,322 @@ function AlunoProgresso({ user }) {
       <div className="card mb4"><div className="card-title">Geral</div><div className="row-b mb2 text-sm"><span className="fw6">{edital?.name}</span><span className="text-muted">{stats.pct}%</span></div><PBar pct={stats.pct}/></div>
       <div className="card">
         <div className="card-title">Por Matéria</div>
-        {(edital?.materias||[]).map(m=>{
-          const mTop=Object.values(plano.plan).flatMap(d=>d.topicos.filter(t=>t.materiaId===m.id));
-          const mFei=mTop.filter(t=>{const dk=Object.entries(plano.plan).find(([,d])=>d.topicos.some(tp=>tp.id===t.id))?.[0];return dk&&progressoModule.isDone(user.id,plano.id,`${dk}-${t.id}`);}).length;
-          const pct=mTop.length?Math.round((mFei/mTop.length)*100):0;
-          return (
-            <div key={m.id} style={{marginBottom:16}}>
-              <div className="row-b mb2"><div className="row"><div className="dot-c" style={{background:m.color}}/><span className="fw6">{m.name}</span></div><span className="text-sm text-muted">{mFei}/{mTop.length} — {pct}%</span></div>
-              <PBar pct={pct} color={m.color}/>
-            </div>
+        {(() => {
+          // Conjunto de topicIds concluídos no progresso (não conta revisões)
+          const doneTopicIds = new Set(
+            (storage.get().progresso || [])
+              .filter(p => p.alunoId === user.id && p.planoId === plano.id && p.done && !p.key.endsWith('-rev'))
+              .map(p => p.key.substring(11))
           );
-        })}
+          return (edital?.materias || []).map(m => {
+            // Topics da matéria atualmente no plano (não concluídos)
+            const inPlanIds = new Set(
+              Object.values(plano.plan).flatMap(d => (d.topicos || [])
+                .filter(t => t.materiaId === m.id)
+                .map(t => t.id))
+            );
+            // Topics da matéria já concluídos (podem ter sido removidos do plano)
+            const feitosDaMateria = (m.topicos || []).filter(t => doneTopicIds.has(t.id));
+            // Total = união de "ainda no plano" + "já feitos"
+            const allIds = new Set([...inPlanIds, ...feitosDaMateria.map(t => t.id)]);
+            const total = allIds.size;
+            const mFei = feitosDaMateria.length;
+            const pct = total ? Math.round((mFei / total) * 100) : 0;
+            return (
+              <div key={m.id} style={{ marginBottom: 16 }}>
+                <div className="row-b mb2">
+                  <div className="row">
+                    <div className="dot-c" style={{ background: m.color }} />
+                    <span className="fw6">{m.name}</span>
+                  </div>
+                  <span className="text-sm text-muted">{mFei}/{total} — {pct}%</span>
+                </div>
+                <PBar pct={pct} color={m.color} />
+              </div>
+            );
+          });
+        })()}
       </div>
+    </div>
+  );
+}
+
+// ============================================================
+// ALUNO: Resumos — Lista, edita, exclui e exporta (PDF/DOCX)
+// ============================================================
+function AlunoResumos({ user, refresh }) {
+  const [search, setSearch] = useState("");
+  const [editing, setEditing] = useState(null); // { topicId, planoId, text }
+  const [confirmDelete, setConfirmDelete] = useState(null); // { topicId, planoId, name }
+  const [expanded, setExpanded] = useState({}); // map topicId → bool
+  const [feedback, setFeedback] = useState("");
+
+  const resumos = progressoModule.listResumos(user.id);
+  const filtered = resumos.filter(r => {
+    if (!search.trim()) return true;
+    const q = search.toLowerCase();
+    return (r.topic.name || "").toLowerCase().includes(q)
+        || (r.materia.name || "").toLowerCase().includes(q)
+        || (r.note || "").toLowerCase().includes(q);
+  });
+
+  // Agrupa por matéria
+  const grupos = {};
+  filtered.forEach(r => {
+    const k = r.materia.id;
+    if (!grupos[k]) grupos[k] = { materia: r.materia, items: [] };
+    grupos[k].items.push(r);
+  });
+  const gruposOrdenados = Object.values(grupos).sort((a,b) => a.materia.name.localeCompare(b.materia.name));
+  gruposOrdenados.forEach(g => g.items.sort((a,b) => (a.updatedAt||"").localeCompare(b.updatedAt||"")));
+
+  const showFeedback = (msg) => {
+    setFeedback(msg);
+    setTimeout(() => setFeedback(""), 2500);
+  };
+
+  const handleSalvarEdicao = () => {
+    if (!editing) return;
+    const text = (editing.text || "").trim();
+    if (!text) {
+      // Texto vazio = deletar
+      progressoModule.deleteNote(user.id, editing.planoId, editing.topicId);
+    } else {
+      progressoModule.saveNote(user.id, editing.planoId, editing.topicId, text);
+    }
+    setEditing(null);
+    showFeedback("✓ Resumo salvo");
+    refresh && refresh();
+  };
+
+  const handleExcluir = () => {
+    if (!confirmDelete) return;
+    progressoModule.deleteNote(user.id, confirmDelete.planoId, confirmDelete.topicId);
+    setConfirmDelete(null);
+    showFeedback("✓ Resumo excluído");
+    refresh && refresh();
+  };
+
+  // ===== Exportação =====
+  const escapeHtml = (s) => String(s||"")
+    .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+    .replace(/"/g,"&quot;").replace(/'/g,"&#39;");
+
+  const buildHtml = (alvo) => {
+    // alvo = lista de resumos (1 ou todos). Retorna HTML completo.
+    const hoje = new Date().toLocaleDateString("pt-BR");
+    const itens = alvo.map(r => {
+      const data = r.updatedAt ? new Date(r.updatedAt).toLocaleDateString("pt-BR") : "—";
+      const noteHtml = escapeHtml(r.note).replace(/\n/g, "<br>");
+      return `
+        <div class="resumo-item">
+          <div class="resumo-meta">
+            <span class="materia" style="background:${r.materia.color || '#6b7280'}">${escapeHtml(r.materia.name)}</span>
+            <span class="data">Atualizado: ${data}</span>
+          </div>
+          <h2>${escapeHtml(r.topic.name)}</h2>
+          <div class="resumo-texto">${noteHtml}</div>
+        </div>`;
+    }).join("\n");
+
+    return `<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<title>Resumos — ${escapeHtml(user.name)}</title>
+<style>
+  @page { size: A4; margin: 18mm 16mm; }
+  body { font-family: 'Segoe UI', Arial, sans-serif; color:#1f2937; line-height:1.55; max-width: 760px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 22px; margin: 0 0 4px; color:#0f172a; }
+  .header { border-bottom: 2px solid #0ea5e9; padding-bottom: 8px; margin-bottom: 18px; }
+  .header .sub { color:#64748b; font-size: 12px; }
+  .resumo-item { page-break-inside: avoid; margin: 0 0 22px; padding: 14px 16px; border:1px solid #e5e7eb; border-radius: 8px; background:#fafafa; }
+  .resumo-item h2 { font-size: 16px; margin: 6px 0 10px; color:#0f172a; }
+  .resumo-meta { display:flex; align-items:center; gap:10px; flex-wrap:wrap; font-size:11px; }
+  .resumo-meta .materia { color:#fff; padding: 3px 9px; border-radius: 999px; font-weight:700; text-transform:uppercase; letter-spacing:.4px; font-size:10px; }
+  .resumo-meta .data { color:#64748b; }
+  .resumo-texto { font-size: 13px; white-space: pre-wrap; color:#1f2937; }
+  .footer { margin-top: 30px; font-size: 10px; color:#94a3b8; text-align:center; }
+</style>
+</head>
+<body>
+  <div class="header">
+    <h1>Resumos de Estudo</h1>
+    <div class="sub">${escapeHtml(user.name)} · Gerado em ${hoje} · ${alvo.length} resumo(s)</div>
+  </div>
+  ${itens}
+  <div class="footer">EstudaAI — Sistema de Gestão de Estudos</div>
+</body>
+</html>`;
+  };
+
+  const exportarPDF = (alvo) => {
+    const html = buildHtml(alvo);
+    const w = window.open("", "_blank", "width=900,height=700");
+    if (!w) { alert("Permita pop-ups para gerar o PDF."); return; }
+    w.document.open();
+    w.document.write(html);
+    w.document.close();
+    setTimeout(() => { try { w.focus(); w.print(); } catch(e){} }, 350);
+  };
+
+  const exportarDOCX = (alvo, fileBase) => {
+    // Word lê HTML nativamente. Salvamos como .doc para evitar
+    // a etapa de "abrir em modo de leitura" que .docx exige.
+    const html = buildHtml(alvo);
+    // Wrapper Word HTML (melhora compatibilidade com Word/Google Docs)
+    const wordHtml = `<html xmlns:o="urn:schemas-microsoft-com:office:office"
+xmlns:w="urn:schemas-microsoft-com:office:word"
+xmlns="http://www.w3.org/TR/REC-html40">${html.replace(/<!DOCTYPE.*?>/i, "").replace(/<\/?html[^>]*>/gi, "")}</html>`;
+    const blob = new Blob([wordHtml], { type: "application/msword;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${fileBase}.doc`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  return (
+    <div>
+      <div className="ph">
+        <div>
+          <h1>✍️ Meus Resumos</h1>
+          <p>{resumos.length} resumo(s) criado(s) · agrupados por matéria</p>
+        </div>
+      </div>
+
+      {feedback && (
+        <div style={{position:"fixed",top:20,right:20,padding:"10px 16px",background:"var(--green)",color:"#fff",borderRadius:8,fontSize:13,fontWeight:600,zIndex:1100,boxShadow:"0 4px 16px rgba(0,0,0,0.2)"}}>
+          {feedback}
+        </div>
+      )}
+
+      <div className="card" style={{marginBottom:16,display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+        <input
+          className="inp"
+          placeholder="🔎 Buscar por matéria, tópico ou conteúdo..."
+          value={search}
+          onChange={e => setSearch(e.target.value)}
+          style={{flex:"1 1 240px",minWidth:240}}
+        />
+        {resumos.length > 0 && (
+          <>
+            <button className="btn btn-ghost" onClick={() => exportarPDF(filtered)} title="Imprimir/PDF de todos">
+              🖨️ PDF (todos {filtered.length})
+            </button>
+            <button className="btn btn-ghost" onClick={() => exportarDOCX(filtered, `resumos-${user.name.replace(/\s+/g,"-")}-completo`)} title="Baixar Word de todos">
+              📄 Word (todos)
+            </button>
+          </>
+        )}
+      </div>
+
+      {resumos.length === 0 ? (
+        <div className="card" style={{textAlign:"center",padding:"40px 20px"}}>
+          <div style={{fontSize:42,marginBottom:8}}>📝</div>
+          <h3 style={{margin:"0 0 4px"}}>Você ainda não criou nenhum resumo</h3>
+          <p className="text-muted text-sm">Quando você estuda uma aula e escreve no campo "Resumo / Anotações", ele aparece aqui.</p>
+        </div>
+      ) : filtered.length === 0 ? (
+        <div className="card" style={{textAlign:"center",padding:"30px 20px"}}>
+          <p className="text-muted">Nenhum resumo combina com sua busca.</p>
+        </div>
+      ) : (
+        gruposOrdenados.map(g => (
+          <div key={g.materia.id} className="card" style={{marginBottom:14}}>
+            <div className="row-b" style={{marginBottom:10,paddingBottom:8,borderBottom:"1px solid var(--b1)"}}>
+              <div style={{display:"flex",alignItems:"center",gap:10}}>
+                <div style={{width:14,height:14,borderRadius:4,background:g.materia.color}}/>
+                <h3 style={{margin:0,fontSize:15}}>{g.materia.name}</h3>
+                <span className="badge bn">{g.items.length}</span>
+              </div>
+            </div>
+            {g.items.map(r => {
+              const isOpen = !!expanded[r.topicId+"::"+r.planoId];
+              const data = r.updatedAt ? new Date(r.updatedAt).toLocaleDateString("pt-BR") : "—";
+              const preview = (r.note || "").slice(0, 180);
+              return (
+                <div key={r.topicId+"::"+r.planoId} style={{padding:"10px 0",borderBottom:"1px solid var(--b1)"}}>
+                  <div className="row-b" style={{alignItems:"flex-start",gap:8}}>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{fontWeight:700,fontSize:13,color:"var(--t1)",marginBottom:3}}>{r.topic.name}</div>
+                      <div style={{fontSize:11,color:"var(--t3)",marginBottom:6}}>Atualizado em {data}</div>
+                      {!isOpen ? (
+                        <div style={{fontSize:12,color:"var(--t2)",lineHeight:1.55,whiteSpace:"pre-wrap"}}>
+                          {preview}{(r.note||"").length>180?"…":""}
+                        </div>
+                      ) : (
+                        <div style={{fontSize:13,color:"var(--t1)",lineHeight:1.7,whiteSpace:"pre-wrap",padding:"10px 12px",background:"var(--s2)",borderRadius:8,borderLeft:"3px solid "+r.materia.color}}>
+                          {r.note}
+                        </div>
+                      )}
+                    </div>
+                    <div style={{display:"flex",gap:6,flexShrink:0,flexWrap:"wrap",justifyContent:"flex-end"}}>
+                      <button className="btn btn-ghost btn-xs" onClick={() => setExpanded(prev => ({...prev, [r.topicId+"::"+r.planoId]: !prev[r.topicId+"::"+r.planoId]}))} title={isOpen?"Recolher":"Expandir"}>
+                        {isOpen ? "🔼" : "🔽"}
+                      </button>
+                      <button className="btn btn-ghost btn-xs" onClick={() => setEditing({ topicId: r.topicId, planoId: r.planoId, text: r.note, name: r.topic.name })} title="Editar">
+                        ✏️
+                      </button>
+                      <button className="btn btn-ghost btn-xs" onClick={() => exportarPDF([r])} title="Imprimir/PDF">
+                        🖨️
+                      </button>
+                      <button className="btn btn-ghost btn-xs" onClick={() => exportarDOCX([r], `resumo-${r.topic.name.replace(/\s+/g,"-").substring(0,40)}`)} title="Baixar Word">
+                        📄
+                      </button>
+                      <button className="btn btn-ghost btn-xs" onClick={() => setConfirmDelete({ topicId: r.topicId, planoId: r.planoId, name: r.topic.name })} title="Excluir" style={{color:"var(--red,#ef4444)"}}>
+                        🗑️
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ))
+      )}
+
+      {/* Modal de edição */}
+      {editing && (
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,padding:16}}>
+          <div className="card" style={{maxWidth:720,width:"100%",maxHeight:"90vh",display:"flex",flexDirection:"column"}}>
+            <div className="row-b" style={{marginBottom:10}}>
+              <h3 style={{margin:0,fontSize:15}}>✏️ Editar resumo: {editing.name}</h3>
+              <button className="btn btn-ghost btn-xs" onClick={() => setEditing(null)}>✕</button>
+            </div>
+            <textarea
+              value={editing.text}
+              onChange={e => setEditing({...editing, text: e.target.value})}
+              autoFocus
+              style={{flex:1,minHeight:300,padding:12,borderRadius:8,border:"1.5px solid var(--b2)",background:"var(--s2)",color:"var(--t1)",fontSize:13,lineHeight:1.6,fontFamily:"inherit",resize:"vertical"}}
+              placeholder="Digite seu resumo..."
+            />
+            <div style={{display:"flex",justifyContent:"flex-end",gap:8,marginTop:12}}>
+              <button className="btn btn-ghost" onClick={() => setEditing(null)}>Cancelar</button>
+              <button className="btn btn-primary" onClick={handleSalvarEdicao}>💾 Salvar</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal de confirmação de exclusão */}
+      {confirmDelete && (
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,padding:16}}>
+          <div className="card" style={{maxWidth:440,width:"100%"}}>
+            <h3 style={{margin:"0 0 8px",fontSize:15}}>🗑️ Excluir resumo</h3>
+            <p style={{margin:"0 0 14px",color:"var(--t2)",fontSize:13}}>
+              Tem certeza que deseja excluir o resumo de <strong>{confirmDelete.name}</strong>? Esta ação não pode ser desfeita.
+            </p>
+            <div style={{display:"flex",justifyContent:"flex-end",gap:8}}>
+              <button className="btn btn-ghost" onClick={() => setConfirmDelete(null)}>Cancelar</button>
+              <button className="btn" style={{background:"var(--red,#ef4444)",color:"#fff"}} onClick={handleExcluir}>Excluir</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -7651,205 +8331,238 @@ function ModalRankingBatalha({ batalhaId, onClose }) {
   );
 }
 
+
 // ============================================================
-// BATALHA: Area do aluno
+// GERADOR DE PROMPT — para estudar com IA
 // ============================================================
-function AlunoBatalha({ user, refresh }) {
-  const [tick, setTick] = useState(0);
-  const [resolvendo, setResolvendo] = useState(null); // { batalhaId, tentativaId }
-  const [verRanking, setVerRanking] = useState(null);
-  const batalhas = batalhasModule.getByAluno(user.id);
-
-  function reload() { setTick(t => t+1); refresh && refresh(); }
-
-  const emojis = ["⚔️","🔥","🧠","🏆","💥","🎯","⚡","🥊"];
-  const emoji = (b) => emojis[b.id.charCodeAt(0) % emojis.length];
-
-  if (resolvendo) {
-    return <ResolverBatalha
-      batalhaId={resolvendo.batalhaId}
-      tentativaId={resolvendo.tentativaId}
-      alunoId={user.id}
-      onVoltar={() => { setResolvendo(null); reload(); }}
-    />;
-  }
-
-  return (
-    <div>
-      <div className="ph"><div><h1>⚔️ Batalhas</h1><p>Compita com seus colegas!</p></div></div>
-
-      {batalhas.length === 0 ? (
-        <div className="card"><div className="empty"><h3>Nenhuma batalha disponivel</h3><p>Seu professor ainda nao criou batalhas.</p></div></div>
-      ) : (
-        <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
-          {batalhas.map(b => {
-            const sim = simuladosModule.getById(b.simuladoId);
-            const minha = (b.participantes || []).find(p => p.alunoId === user.id);
-            const total = b.participantes?.length || 0;
-            const finalizados = b.participantes?.filter(p => p.finalizado).length || 0;
-            const ranking = batalhasModule.getRanking(b.id);
-            const minhaPos = minha?.finalizado ? ranking.findIndex(p => p.alunoId === user.id) + 1 : null;
-
-            return (
-              <div key={b.id} style={{ padding:20, borderRadius:12, background:"var(--s1)", border:"1px solid " + (b.status === "ativa" ? "var(--b2)" : "var(--b1)") }}>
-                <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:12 }}>
-                  <div>
-                    <div style={{ fontSize:18, fontWeight:900, fontFamily:"Cabinet Grotesk", marginBottom:4 }}>
-                      {emoji(b)} {b.nome}
-                    </div>
-                    <div style={{ fontSize:12, color:"var(--t3)" }}>
-                      {sim?.nome || "Simulado"} · {finalizados}/{total} finalizaram
-                      {b.dataFim && " · Encerra: " + new Date(b.dataFim+"T00:00:00").toLocaleDateString("pt-BR")}
-                    </div>
-                  </div>
-                  {minha?.finalizado && minhaPos && (
-                    <div style={{ textAlign:"center" }}>
-                      <div style={{ fontSize:26, fontWeight:900, fontFamily:"Cabinet Grotesk", color: minhaPos === 1 ? "gold" : minhaPos === 2 ? "silver" : "var(--amber)" }}>
-                        {minhaPos === 1 ? "🥇" : minhaPos === 2 ? "🥈" : minhaPos === 3 ? "🥉" : "#" + minhaPos}
-                      </div>
-                      <div style={{ fontSize:10, color:"var(--t3)" }}>Sua posicao</div>
-                    </div>
-                  )}
-                </div>
-
-                {minha?.finalizado ? (
-                  <div style={{ marginBottom:12 }}>
-                    <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:8, marginBottom:10 }}>
-                      <div style={{ padding:10, borderRadius:8, background:"var(--green-d)", textAlign:"center" }}>
-                        <div style={{ fontSize:18, fontWeight:900, color:"var(--green)" }}>{minha.acertos}</div>
-                        <div style={{ fontSize:9, color:"var(--green)", textTransform:"uppercase" }}>Acertos</div>
-                      </div>
-                      <div style={{ padding:10, borderRadius:8, background:"rgba(239,68,68,.1)", textAlign:"center" }}>
-                        <div style={{ fontSize:18, fontWeight:900, color:"var(--red)" }}>{minha.erros}</div>
-                        <div style={{ fontSize:9, color:"var(--red)", textTransform:"uppercase" }}>Erros</div>
-                      </div>
-                      <div style={{ padding:10, borderRadius:8, background:"var(--s2)", textAlign:"center" }}>
-                        <div style={{ fontSize:18, fontWeight:900, color:"var(--t2)" }}>{minha.brancos}</div>
-                        <div style={{ fontSize:9, color:"var(--t3)", textTransform:"uppercase" }}>Em branco</div>
-                      </div>
-                    </div>
-                    {minha.pontosCebraspe !== null && (
-                      <div style={{ padding:10, borderRadius:8, background:"var(--s2)", textAlign:"center", marginBottom:8 }}>
-                        <div style={{ fontSize:11, color:"var(--t3)", marginBottom:2 }}>Pontuacao Liquida Cebraspe</div>
-                        <div style={{ fontSize:22, fontWeight:900, fontFamily:"Cabinet Grotesk", color: minha.pontosCebraspe >= 0 ? "var(--green)" : "var(--red)" }}>
-                          {minha.pontosCebraspe > 0 ? "+" : ""}{minha.pontosCebraspe} pontos
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                ) : b.status === "ativa" ? (
-                  <div style={{ padding:12, borderRadius:8, background:"var(--s2)", textAlign:"center", marginBottom:12, fontSize:13, color:"var(--t3)" }}>
-                    Voce ainda nao participou desta batalha
-                  </div>
-                ) : (
-                  <div style={{ padding:12, borderRadius:8, background:"var(--s2)", textAlign:"center", marginBottom:12, fontSize:13, color:"var(--t3)" }}>
-                    Batalha encerrada - nao participou
-                  </div>
-                )}
-
-                <div style={{ display:"flex", gap:8 }}>
-                  {!minha?.finalizado && b.status === "ativa" && (
-                    <button
-                      onClick={() => {
-                        const nova = tentativasModule.create(b.simuladoId, user.id);
-                        setResolvendo({ batalhaId: b.id, tentativaId: nova.id });
-                      }}
-                      style={{ flex:2, padding:"10px", borderRadius:10, border:"none", background:"var(--green)", color:"#07080f", fontSize:13, fontWeight:900, cursor:"pointer", fontFamily:"Cabinet Grotesk" }}
-                    >
-                      Entrar na Batalha
-                    </button>
-                  )}
-                  <button onClick={() => setVerRanking(b.id)} style={{ flex:1, padding:"10px", borderRadius:10, border:"none", background:"var(--blue-d)", color:"var(--blue)", fontSize:12, fontWeight:700, cursor:"pointer" }}>
-                    Ver Ranking
-                  </button>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
-      {verRanking && <ModalRankingBatalha batalhaId={verRanking} onClose={() => setVerRanking(null)} />}
-    </div>
-  );
-}
-
-function ResolverBatalha({ batalhaId, tentativaId, alunoId, onVoltar }) {
-  const batalha = batalhasModule.getById(batalhaId);
-  const questoes = batalha ? questoesModule.getBySimulado(batalha.simuladoId) : [];
-  const isCE = questoes.every(q => q.tipo === "ce");
-
-  function handleFinalizar() {
-    tentativasModule.finalizar(tentativaId, 0);
-    const tent = tentativasModule.getById(tentativaId);
-    if (tent) {
-      batalhasModule.registrarResultado(
-        batalhaId, alunoId, tentativaId,
-        tent.acertos || 0, tent.erros || 0, tent.brancos || 0,
-        tent.pontosCebraspe, tent.percentual || 0,
-        tent.tempoDecorridoSegundos || 0
-      );
-    }
-    onVoltar();
-  }
-
-  return (
-    <ResolverSimulado
-      tentativaId={tentativaId}
-      onVoltar={handleFinalizar}
-    />
-  );
-}
-
-
 function GeradorDePrompt() {
   const [tema, setTema] = useState("");
-  const [modo, setModo] = useState("estudo-padrao");
+  const [materia, setMateria] = useState("");
+  const [modo, setModo] = useState("apostila-completa");
+  const [nivel, setNivel] = useState("intermediario");
+  const [banca, setBanca] = useState("");
+  // Campos editáveis do prompt-padrão (Apostila Completa)
+  const [especialidade, setEspecialidade] = useState("concursos públicos");
+  const [foco, setFoco] = useState("Tribunais de Contas (Banca CESPE)");
+  const [concursoAlvo, setConcursoAlvo] = useState("cebraspe tcerj");
   const [promptGerado, setPromptGerado] = useState("");
   const [copied, setCopied] = useState(false);
 
-  const BASE = "Você é um professor especialista em concursos públicos de alto nível, com foco em provas de Tribunais de Contas, banca CESPE/Cebraspe, e especialista em didática para aprovação.";
-
   const MODOS = [
-    { id:"estudo-padrao",      icon:"📘", label:"Estudo Padrão",       desc:"Apostila completa com teoria, questões e decoreba" },
-    { id:"revisar-rapido",     icon:"⚡", label:"Revisar Rápido",      desc:"Revisão objetiva para véspera de prova" },
-    { id:"decorar-lei-seca",   icon:"⚖️", label:"Decorar Lei Seca",    desc:"Texto legal mastigado e memorização" },
-    { id:"fazer-questoes",     icon:"❓", label:"Fazer Questões",      desc:"Banco de questões estilo CESPE comentadas" },
-    { id:"treinar-prova",      icon:"🎯", label:"Treinar para Prova",  desc:"Simulação intensiva com gabarito e estratégia" },
-    { id:"tema-dificil",       icon:"🧩", label:"Resolver Tema Difícil",desc:"Explicação do zero com analogias e exemplos" },
-    { id:"resumo-estrategico", icon:"📝", label:"Resumo Estratégico",  desc:"Pontos-chave, pegadinhas e palavras-chave" },
+    { id: "apostila-completa",    icon: "📘", label: "Apostila Completa (DOCX)", desc: "Material premium em 8 seções — visão geral, teoria, resumo, pegadinhas, 25+ questões, CESPE C/E, dicas e decoreba." },
+    { id: "estudo-padrao",        icon: "🎓", label: "Estudo Padrão",        desc: "Aula completa com explicação, exemplos e questões." },
+    { id: "revisao-rapida",       icon: "⚡", label: "Revisão Rápida",       desc: "Resumão dos pontos-chave em formato direto." },
+    { id: "questoes-comentadas",  icon: "✍️", label: "Questões Comentadas",  desc: "10 questões CESPE-style com gabarito comentado." },
+    { id: "mapa-mental",          icon: "🧠", label: "Mapa Mental",          desc: "Estrutura hierárquica do tema em tópicos." },
+    { id: "resumo",               icon: "📖", label: "Resumo Completo",      desc: "Síntese clara e objetiva do conteúdo." },
+    { id: "macetes",              icon: "🎯", label: "Macetes & Pegadinhas", desc: "Truques e armadilhas comuns da banca." },
+    { id: "comparativo",          icon: "🔄", label: "Quadro Comparativo",   desc: "Tabela comparando conceitos parecidos." },
+    { id: "jurisprudencia",       icon: "⚖️", label: "Jurisprudência",      desc: "Decisões relevantes do STF/STJ/TCU sobre o tema." },
   ];
 
-  function buildPrompt(t, md) {
-    const P = {
-      "estudo-padrao": BASE + "\n\nSua tarefa é criar um MATERIAL COMPLETO em formato de apostila sobre o tema: " + t + "\n\nSiga EXATAMENTE esta estrutura:\n\n📘 1. VISÃO GERAL DO TEMA\n• Explique o tema de forma simples e objetiva\n• Contextualize para concursos públicos\n• Destaque a importância para provas de controle externo\n\n📚 2. FUNDAMENTAÇÃO TEÓRICA COMPLETA\n• Aborde TODOS os conceitos relevantes com profundidade de prova\n• Inclua: definições formais, classificações, princípios, exceções, pegadinhas\n• Relacione com: Constituição Federal, legislação aplicável e jurisprudência\n\n🧠 3. RESUMO ESTRUTURADO\n• Bullet points objetivos para revisão pré-prova\n• Destaque palavras-chave\n\n⚠️ 4. PRINCIPAIS PEGADINHAS DE PROVA\n• Erros mais comuns e como a banca CESPE costuma cobrar\n\n📝 5. QUESTÕES DE FIXAÇÃO\n• 10 questões nível fácil (múltipla escolha A–E)\n• 10 questões nível médio (múltipla escolha A–E)\n• 5 questões nível difícil (múltipla escolha A–E)\nApresente PRIMEIRO todas sem gabarito, DEPOIS repita com gabarito comentado.\n\n🎯 6. QUESTÕES CERTO/ERRADO (CESPE)\n• 20 assertivas — primeiro todas, depois repita com gabarito comentado\n\n🧩 7. DECOREBA (VÉSPERA DE PROVA)\n• Prazos, números, competências, exceções e classificações para memorizar\n\nRegras: NÃO resuma demais. Seja aprofundado. Use exemplos práticos. Foco total em aprovação.",
+  const NIVEIS = [
+    { id: "iniciante", label: "Iniciante", desc: "Quero entender do zero" },
+    { id: "intermediario", label: "Intermediário", desc: "Já tenho noção, quero aprofundar" },
+    { id: "avancado", label: "Avançado", desc: "Quero pegadinhas e nível alta cobrança" },
+  ];
 
-      "revisar-rapido": BASE + "\n\nPreciso de uma REVISÃO RÁPIDA e objetiva sobre: " + t + "\n\nOrganize assim:\n\n⚡ 1. CONCEITO EM 3 LINHAS — o essencial que preciso saber\n\n🔑 2. PALAVRAS-CHAVE — termos que a banca usa e que não posso esquecer\n\n🎯 3. O QUE MAIS CAI — top 5 pontos cobrados pela banca CESPE em Tribunais de Contas\n\n⚠️ 4. PEGADINHAS CLÁSSICAS — os erros que derrubam o candidato\n\n⚡ 5. DIFERENÇAS IMPORTANTES — institutos parecidos que a banca confunde\n\n📌 6. QUADRO FINAL DE REVISÃO — resumo em bullet points para ler em 2 minutos\n\nRegras: linguagem telegráfica, objetivo, sem enrolação. Ideal para ler 1 hora antes da prova.",
+  const BASE = "Você é um professor especialista em concursos públicos de alto nível, com foco em provas de Tribunais de Contas, banca CESPE/Cebraspe, e especialista em didática para aprovação.";
 
-      "decorar-lei-seca": BASE + "\n\nPreciso decorar a lei seca sobre: " + t + "\n\nTransforme o texto legal em material de memorização:\n\n⚖️ 1. ARTIGOS ESSENCIAIS — transcreva cada um em linguagem simples\n• O que o artigo diz (em palavras normais)\n• O que significa na prática\n• Como a banca pode cobrar esse artigo\n• Pegadinha do texto literal\n• Palavra-chave que precisa ser decorada\n\n📌 2. ESQUEMA DE MEMORIZAÇÃO — organize os artigos em grupos lógicos (ex: prazos, competências, vedações)\n\n🔢 3. NÚMEROS E PRAZOS — tabela com todos os valores numéricos da lei\n\n❌ 4. VEDAÇÕES — o que a lei proíbe expressamente\n\n✅ 5. OBRIGAÇÕES — o que a lei determina expressamente\n\n🃏 6. FICHA PARA COLAR NA CABEÇA — resumo ultra-compacto para memorizar de véspera\n\n📝 7. 15 QUESTÕES CERTO/ERRADO sobre o texto literal, com gabarito comentado",
+  // Apostila completa: prompt-padrão de alto nível para gerar material em DOCX.
+  // Os campos especialidade / foco / concursoAlvo são editáveis pelo aluno na UI.
+  function buildApostilaCompleta(temaArg, materiaArg) {
+    const especTxt = (especialidade || "").trim() || "concursos públicos";
+    const focoTxt  = (foco || "").trim() || "Tribunais de Contas (Banca CESPE)";
+    const alvoTxt  = (concursoAlvo || "").trim() || "cebraspe tcerj";
+    const materiaTxt = (materiaArg || "").trim();
+    const materiaLine = materiaTxt ? `\nMatéria: ${materiaTxt}` : "";
+    return `Você é um professor especialista em ${especTxt} de alto nível, com foco em provas de ${focoTxt} e um especialista em produção de conteúdo em formato docx
+Sua tarefa é criar um MATERIAL COMPLETO em formato de apostila para estudo, com linguagem clara, didática e aprofundada, sobre o seguinte tema em formato docx pronto para download para ${alvoTxt} com o seguinte tema:
+${temaArg}${materiaLine}
+O material deve seguir EXATAMENTE a estrutura abaixo:
+📘 1. VISÃO GERAL DO TEMA
 
-      "fazer-questoes": BASE + "\n\nCrie um BANCO DE QUESTÕES INTENSIVO sobre: " + t + "\n\nElabore:\n• 10 questões múltipla escolha nível fácil (A–E)\n• 15 questões múltipla escolha nível médio (A–E)\n• 5 questões múltipla escolha nível difícil (A–E)\n• 25 assertivas estilo CERTO/ERRADO (CESPE/Cebraspe)\n\nFoco em:\n• Confundir o candidato como a banca faz\n• Pegadinhas reais de provas de Tribunais de Contas\n• Detalhes que parecem corretos mas estão errados\n\nApresente PRIMEIRO todas as questões SEM gabarito (separadas por nível).\nDepois, repita com GABARITO COMENTADO:\n• Explique cada alternativa (certa e errada)\n• Destaque a pegadinha central\n• Explique por que o candidato erraria",
+* Explique o tema de forma simples e objetiva
+* Contextualize para concursos públicos
+* Destaque a importância do tema para provas de controle externo
+📚 2. FUNDAMENTAÇÃO TEÓRICA COMPLETA
 
-      "treinar-prova": BASE + "\n\nQuero TREINAR PARA A PROVA com o tema: " + t + "\n\nMonte uma sessão de treino intensivo:\n\n🎯 PARTE 1 — AQUECIMENTO (revisão rápida)\n• Conceito central em até 5 bullet points\n• 3 pegadinhas clássicas do tema\n\n📝 PARTE 2 — SIMULADO (responda sem gabarito primeiro)\n• 10 questões múltipla escolha estilo Tribunais de Contas\n• 15 questões certo/errado estilo CESPE\n• Nível: médio a difícil\n\n🔍 PARTE 3 — GABARITO COMENTADO\n• Explique cada questão em detalhe\n• Para as erradas: mostre onde o candidato se perde\n• Destaque a lógica da banca\n\n🧠 PARTE 4 — PONTOS DE ATENÇÃO\n• O que errei mais nesse tema e por quê\n• Estratégia para não errar na prova real",
+* Aborde TODOS os conceitos relevantes
+* Use linguagem didática, mas com profundidade de prova
+* Estruture com subtítulos bem organizados
+* Inclua:
+   * definições formais
+   * classificações
+   * princípios
+   * exceções
+   * pegadinhas de prova
+* Sempre que possível, relacione com:
+   * Constituição Federal
+   * legislação aplicável
+   * jurisprudência relevante
+🧠 3. RESUMO ESTRUTURADO (REVISÃO RÁPIDA)
 
-      "tema-dificil": BASE + "\n\nPreciso entender do ZERO o tema: " + t + "\n\nTenho muita dificuldade nesse assunto. Por favor:\n\n🌱 1. EXPLICAÇÃO BÁSICA — como se eu nunca tivesse visto\n• Use linguagem simples e acessível\n• Evite jargão técnico no começo\n\n🔗 2. ANALOGIA DO DIA A DIA — compare com algo do cotidiano para facilitar\n\n📶 3. EVOLUÇÃO GRADUAL — agora avance para o nível técnico exigido em prova\n• Introduza os termos corretos\n• Explique o raciocínio jurídico por trás\n\n🔄 4. PASSO A PASSO — como raciocinar sobre esse tema em questões\n• Qual pergunta fazer na minha cabeça ao ver uma questão desse tema\n\n⚠️ 5. POR QUE AS PESSOAS ERRAM — pontos que geram mais confusão\n\n✅ 6. EXEMPLOS PRÁTICOS — situações reais ou hipotéticas\n\n📝 7. QUESTÕES COMENTADAS — 8 questões do básico ao avançado com explicação detalhada\n\nRegras: Seja didático acima de tudo. Não pule etapas. Use exemplos. Foco em clareza.",
+* Bullet points objetivos
+* Ideal para revisão pré-prova
+* Destaque palavras-chave
+⚠️ 4. PRINCIPAIS PEGADINHAS DE PROVA
 
-      "resumo-estrategico": BASE + "\n\nCrie um RESUMO ESTRATÉGICO de alta qualidade sobre: " + t + "\n\nEstrutura obrigatória:\n\n📌 1. CONCEITO CENTRAL — definição precisa e contextualização para concursos\n\n🎯 2. O QUE MAIS CAI EM PROVA — top 7 pontos cobrados pela banca CESPE em Tribunais de Contas\n\n🔑 3. PALAVRAS-CHAVE — termos que a banca usa e que precisam ser decorados\n\n⚖️ 4. BASE LEGAL — CF, lei e jurisprudência relevante para cada ponto\n\n🔀 5. DIFERENÇAS E COMPARAÇÕES — institutos parecidos e como distingui-los\n\n⚠️ 6. PRINCIPAIS PEGADINHAS — erros mais comuns com explicação de por que são pegadinhas\n\n📊 7. QUADRO COMPARATIVO (se aplicável) — tabela para visualizar diferenças\n\n⚡ 8. REVISÃO RÁPIDA FINAL — bullet points para ler em 3 minutos antes da prova\n\nRegras: Linguagem objetiva. Destaque o que mais cai. Nada de enrolação. Escreva como material de véspera.",
-    };
-    return P[md] || "";
+* Liste os erros mais comuns
+* Explique por que são pegadinhas
+* Mostre como a banca costuma cobrar
+📝 5. QUESTÕES DE FIXAÇÃO (MUITAS)
+Crie no mínimo:
+·         10 questões nível fácil
+
+* 10 questões nível médio
+* 5 questões nível difícil
+Formato:
+
+* Múltipla escolha (A a E)
+* C/E (certo errado estilo cespe)
+* Formate de forma correta (pulando uma linha após cada questão para organizar melhor)
+
+⚠️ ORDEM OBRIGATÓRIA:
+1. PRIMEIRO mostre TODAS as 25 questões SEM as respostas (sem indicar gabarito, sem comentários, sem dicas).
+2. DEPOIS, em uma seção separada chamada "GABARITO COMENTADO — QUESTÕES DE FIXAÇÃO", repita CADA questão com:
+   * o gabarito (letra ou C/E)
+   * explicação detalhada do porquê da alternativa correta
+   * explicação de por que cada alternativa errada está errada
+   * fundamentação legal/normativa quando aplicável
+
+🎯 6. QUESTÕES ESTILO CERTO/ERRADO (CESPE)
+
+⚠️ ORDEM OBRIGATÓRIA (igual à seção 5):
+1. PRIMEIRO mostre as 20 assertivas SEM gabarito e SEM comentários.
+2. DEPOIS, em uma seção separada chamada "GABARITO COMENTADO — CESPE C/E", repita CADA assertiva com:
+   * gabarito (Certo / Errado)
+   * justificativa detalhada (citando legislação, jurisprudência, doutrina)
+   * indicação da pegadinha quando houver
+🧩 7. DICAS DE PROVA
+
+* Estratégias práticas
+* Como identificar respostas corretas
+* Padrões das bancas
+🧩 8. DECOREBA
+
+* Gere uma seção com todo o conteúdo que deve ser decorado na semana da prova
+* Esse tipo de conteúdo é de memorização de curto prazo, então o aluno só estuda na semana da prova para não esquecer
+* Ex: Prazos, Quantidade de Membros em uma Comissão, etc (sem prejuízo de outras)
+📌 REGRAS IMPORTANTES
+
+* NÃO resuma demais — quero conteúdo completo
+* NÃO seja superficial
+* Use exemplos práticos sempre que possível
+* Escreva como se fosse uma apostila premium
+* Linguagem clara, mas técnica
+* Foco total em aprovação
+* SEMPRE coloque as questões SEM as respostas primeiro e o GABARITO COMENTADO no final, em seção separada — isso vale para a seção 5 (questões de fixação) e a seção 6 (CESPE C/E). Nunca misture pergunta e resposta no mesmo bloco.
+Agora gere o conteúdo completo.`;
   }
 
   function handleGerar() {
-    if (!tema.trim()) return;
-    setPromptGerado(buildPrompt(tema.trim(), modo));
-    setCopied(false);
+    if (!tema.trim()) { alert("Informe o tema da aula."); return; }
+
+    // Modo "Apostila Completa" usa o prompt-padrão completo, sem cabeçalho extra.
+    if (modo === "apostila-completa") {
+      const prompt = buildApostilaCompleta(tema.trim(), materia);
+      setPromptGerado(prompt);
+      setTimeout(() => { const el = document.getElementById("gp-output"); if (el) el.scrollIntoView({ behavior: "smooth", block: "start" }); }, 150);
+      return;
+    }
+
+    const modoSel = MODOS.find(m => m.id === modo);
+    const nivelSel = NIVEIS.find(n => n.id === nivel);
+
+    const ctx = [];
+    if (materia.trim()) ctx.push(`MATÉRIA: ${materia.trim()}`);
+    ctx.push(`TEMA: ${tema.trim()}`);
+    if (banca.trim()) ctx.push(`BANCA / CONCURSO ALVO: ${banca.trim()}`);
+    ctx.push(`NÍVEL DO ALUNO: ${nivelSel?.label || nivel}`);
+    ctx.push(`MODO SOLICITADO: ${modoSel?.label || modo}`);
+
+    let instrucao = "";
+    switch (modo) {
+      case "estudo-padrao":
+        instrucao = `Produza uma aula completa e didática sobre "${tema}".
+A aula deve conter:
+1. Conceito-chave em 3 linhas
+2. Explicação aprofundada com exemplos práticos
+3. Fundamentação legal/normativa quando aplicável (citar artigos)
+4. 5 questões estilo CESPE no final, com gabarito comentado
+5. Resumo final com os tópicos mais importantes para a prova`;
+        break;
+      case "revisao-rapida":
+        instrucao = `Faça uma revisão RÁPIDA e DIRETA sobre "${tema}".
+Apenas tópicos essenciais em formato de bullets, sem rodeios.
+Foque no que cai em prova. Máximo 1 página.`;
+        break;
+      case "questoes-comentadas":
+        instrucao = `Crie 10 questões estilo CESPE/Cebraspe sobre "${tema}".
+Para cada questão:
+- Enunciado em formato C/E (Certo/Errado)
+- Gabarito + comentário explicando POR QUE está certo ou errado
+- Indicar a pegadinha quando houver
+- Citar a base legal/normativa`;
+        break;
+      case "mapa-mental":
+        instrucao = `Construa um mapa mental textual do tema "${tema}".
+Use estrutura hierárquica com indentação:
+- Tema central
+  - Conceito 1
+    - Subconceito 1.1
+    - Subconceito 1.2
+  - Conceito 2
+    - ...
+Inclua relações entre os conceitos.`;
+        break;
+      case "resumo":
+        instrucao = `Faça um resumo completo e didático sobre "${tema}".
+O resumo deve:
+1. Ser claro e objetivo
+2. Ter no máximo 2 páginas
+3. Destacar os pontos mais cobrados em prova
+4. Usar negrito para conceitos-chave
+5. Incluir no final um "TOP 5 do que mais cai"`;
+        break;
+      case "macetes":
+        instrucao = `Liste os MACETES, MNEMÔNICOS e PEGADINHAS sobre "${tema}".
+Foque em:
+- Truques para memorização rápida
+- Pegadinhas comuns que a banca usa
+- Diferenças sutis que confundem candidatos
+- Frases-chave que indicam resposta correta/errada`;
+        break;
+      case "comparativo":
+        instrucao = `Crie um QUADRO COMPARATIVO sobre "${tema}".
+Use formato de tabela markdown comparando os conceitos relacionados.
+Colunas devem incluir: Conceito | Definição | Hipóteses | Efeitos | Fundamentação Legal.
+No final, destaque as DIFERENÇAS que mais caem em prova.`;
+        break;
+      case "jurisprudencia":
+        instrucao = `Liste as principais DECISÕES e SÚMULAS do STF, STJ e TCU sobre "${tema}".
+Para cada uma:
+- Órgão + número da decisão/súmula
+- Resumo do caso
+- Tese fixada
+- Por que isso cai em prova`;
+        break;
+      default:
+        instrucao = `Aborde o tema "${tema}" de forma completa.`;
+    }
+
+    const prompt = `${BASE}\n\n${ctx.join("\n")}\n\n${instrucao}\n\nUse linguagem clara, exemplos concretos e referências à legislação quando aplicável. Adapte a profundidade ao nível "${nivelSel?.label || nivel}".`;
+    setPromptGerado(prompt);
     setTimeout(() => { const el = document.getElementById("gp-output"); if (el) el.scrollIntoView({ behavior:"smooth", block:"start" }); }, 150);
   }
 
   function handleCopiar() {
+    if (!promptGerado) return;
     navigator.clipboard.writeText(promptGerado).then(() => { setCopied(true); setTimeout(() => setCopied(false), 2500); });
   }
 
   function handleDownload() {
+    if (!promptGerado) return;
     const blob = new Blob([promptGerado], { type:"text/plain;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -7859,57 +8572,139 @@ function GeradorDePrompt() {
     URL.revokeObjectURL(url);
   }
 
+  function handleAbrirChatGPT() {
+    if (!promptGerado) return;
+    handleCopiar();
+    window.open("https://chat.openai.com/", "_blank");
+  }
+
+  function handleAbrirClaude() {
+    if (!promptGerado) return;
+    handleCopiar();
+    window.open("https://claude.ai/", "_blank");
+  }
+
   return (
-    <div style={{ maxWidth:800, margin:"0 auto", padding:"32px 24px" }}>
-      <div style={{ marginBottom:32 }}>
-        <h1 style={{ fontSize:26, fontWeight:900, fontFamily:"Cabinet Grotesk", marginBottom:8 }}>🧠 Gerador Inteligente de Prompts para Concursos</h1>
-        <p style={{ color:"var(--t2)", fontSize:15, margin:0 }}>Crie prompts premium para estudar qualquer assunto com IA.</p>
+    <div style={{ maxWidth: 860, margin: "0 auto", padding: "32px 24px" }}>
+      <div style={{ marginBottom: 32 }}>
+        <h1 style={{ fontSize: 26, fontWeight: 900, fontFamily: "Cabinet Grotesk", marginBottom: 8 }}>🧠 Gerador Inteligente de Prompts para Concursos</h1>
+        <p style={{ color: "var(--t2)", fontSize: 15, margin: 0 }}>Crie prompts premium para estudar qualquer assunto com IA (ChatGPT, Claude, Gemini).</p>
       </div>
 
-      <div style={{ marginBottom:24 }}>
-        <label style={{ fontSize:11, fontWeight:700, letterSpacing:.6, textTransform:"uppercase", color:"var(--t3)", display:"block", marginBottom:8 }}>📖 Tema da aula / assunto</label>
-        <input className="inp" value={tema} onChange={e=>setTema(e.target.value)} onKeyDown={e=>e.key==="Enter"&&handleGerar()} placeholder="Ex: Controle de Constitucionalidade · Licitações Lei 14.133 · Auditoria Governamental · Ato Administrativo" style={{ fontSize:15, padding:"14px 16px" }}/>
-      </div>
+      <div className="card" style={{ marginBottom: 16 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 16 }}>
+          <div>
+            <label style={{ fontSize: 11, fontWeight: 700, letterSpacing: .6, textTransform: "uppercase", color: "var(--t3)", display: "block", marginBottom: 6 }}>📖 Tema da aula *</label>
+            <input className="inp" value={tema} onChange={e => setTema(e.target.value)} onKeyDown={e => e.key === "Enter" && handleGerar()} placeholder="Ex: Controle de Constitucionalidade · Licitações Lei 14.133" />
+          </div>
+          <div>
+            <label style={{ fontSize: 11, fontWeight: 700, letterSpacing: .6, textTransform: "uppercase", color: "var(--t3)", display: "block", marginBottom: 6 }}>📚 Matéria (opcional)</label>
+            <input className="inp" value={materia} onChange={e => setMateria(e.target.value)} placeholder="Ex: Direito Constitucional" />
+          </div>
+        </div>
 
-      <div style={{ marginBottom:28 }}>
-        <label style={{ fontSize:11, fontWeight:700, letterSpacing:.6, textTransform:"uppercase", color:"var(--t3)", display:"block", marginBottom:12 }}>O que você quer fazer?</label>
-        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(220px, 1fr))", gap:10 }}>
-          {MODOS.map(m=>(
-            <label key={m.id} style={{ display:"flex", alignItems:"flex-start", gap:12, padding:"14px", borderRadius:10, background:modo===m.id?"var(--green-d)":"var(--s2)", border:"1.5px solid "+(modo===m.id?"var(--green)":"var(--b2)"), cursor:"pointer", transition:"all .15s" }}>
-              <input type="radio" name="modo" checked={modo===m.id} onChange={()=>setModo(m.id)} style={{ accentColor:"var(--green)", flexShrink:0, marginTop:2 }}/>
+        <div style={{ marginBottom: 16 }}>
+          <label style={{ fontSize: 11, fontWeight: 700, letterSpacing: .6, textTransform: "uppercase", color: "var(--t3)", display: "block", marginBottom: 6 }}>🏛️ Banca / Concurso (opcional, para outros modos)</label>
+          <input className="inp" value={banca} onChange={e => setBanca(e.target.value)} placeholder="Ex: TCE-RJ 2026 · CESPE/Cebraspe · FGV" />
+        </div>
+
+        {modo === "apostila-completa" && (
+          <div style={{ marginBottom: 16, padding: 14, borderRadius: 10, background: "var(--s2)", border: "1px dashed var(--b2)" }}>
+            <div style={{ fontSize: 11, fontWeight: 800, letterSpacing: .8, textTransform: "uppercase", color: "var(--green)", marginBottom: 10 }}>📘 Personalização da Apostila Completa</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
               <div>
-                <div style={{ fontSize:13, fontWeight:700 }}>{m.icon} {m.label}</div>
-                <div style={{ fontSize:11, color:"var(--t3)", marginTop:2 }}>{m.desc}</div>
+                <label style={{ fontSize: 10, fontWeight: 700, letterSpacing: .6, textTransform: "uppercase", color: "var(--t3)", display: "block", marginBottom: 6 }}>🎓 Área de Especialidade do professor</label>
+                <input className="inp" value={especialidade} onChange={e => setEspecialidade(e.target.value)} placeholder="Ex: concursos públicos · medicina · direito tributário" />
               </div>
-            </label>
-          ))}
+              <div>
+                <label style={{ fontSize: 10, fontWeight: 700, letterSpacing: .6, textTransform: "uppercase", color: "var(--t3)", display: "block", marginBottom: 6 }}>🎯 Foco em provas de</label>
+                <input className="inp" value={foco} onChange={e => setFoco(e.target.value)} placeholder="Ex: Tribunais de Contas (Banca CESPE)" />
+              </div>
+            </div>
+            <div>
+              <label style={{ fontSize: 10, fontWeight: 700, letterSpacing: .6, textTransform: "uppercase", color: "var(--t3)", display: "block", marginBottom: 6 }}>📥 Pronto para download para</label>
+              <input className="inp" value={concursoAlvo} onChange={e => setConcursoAlvo(e.target.value)} placeholder="Ex: cebraspe tcerj · prova TCU 2026" />
+            </div>
+            <div style={{ marginTop: 8, fontSize: 11, color: "var(--t3)" }}>
+              💡 Esses 3 campos preenchem automaticamente o cabeçalho do prompt. Os valores padrão são "concursos públicos", "Tribunais de Contas (Banca CESPE)" e "cebraspe tcerj".
+            </div>
+          </div>
+        )}
+
+        <div style={{ marginBottom: 16 }}>
+          <label style={{ fontSize: 11, fontWeight: 700, letterSpacing: .6, textTransform: "uppercase", color: "var(--t3)", display: "block", marginBottom: 8 }}>📊 Seu nível neste tema</label>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8 }}>
+            {NIVEIS.map(n => (
+              <label key={n.id} style={{ display: "flex", alignItems: "flex-start", gap: 8, padding: "10px 12px", borderRadius: 8, background: nivel === n.id ? "var(--blue-d)" : "var(--s2)", border: "1.5px solid " + (nivel === n.id ? "var(--blue)" : "var(--b2)"), cursor: "pointer", transition: "all .15s" }}>
+                <input type="radio" name="nivel" checked={nivel === n.id} onChange={() => setNivel(n.id)} style={{ accentColor: "var(--blue)", flexShrink: 0, marginTop: 2 }} />
+                <div>
+                  <div style={{ fontSize: 12, fontWeight: 700 }}>{n.label}</div>
+                  <div style={{ fontSize: 10, color: "var(--t3)", marginTop: 2 }}>{n.desc}</div>
+                </div>
+              </label>
+            ))}
+          </div>
+        </div>
+
+        <div style={{ marginBottom: 4 }}>
+          <label style={{ fontSize: 11, fontWeight: 700, letterSpacing: .6, textTransform: "uppercase", color: "var(--t3)", display: "block", marginBottom: 8 }}>🎯 O que você quer fazer?</label>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: 10 }}>
+            {MODOS.map(m => (
+              <label key={m.id} style={{ display: "flex", alignItems: "flex-start", gap: 10, padding: "12px", borderRadius: 10, background: modo === m.id ? "var(--green-d)" : "var(--s2)", border: "1.5px solid " + (modo === m.id ? "var(--green)" : "var(--b2)"), cursor: "pointer", transition: "all .15s" }}>
+                <input type="radio" name="modo" checked={modo === m.id} onChange={() => setModo(m.id)} style={{ accentColor: "var(--green)", flexShrink: 0, marginTop: 2 }} />
+                <div>
+                  <div style={{ fontSize: 13, fontWeight: 700 }}>{m.icon} {m.label}</div>
+                  <div style={{ fontSize: 11, color: "var(--t3)", marginTop: 2 }}>{m.desc}</div>
+                </div>
+              </label>
+            ))}
+          </div>
         </div>
       </div>
 
-      <button onClick={handleGerar} disabled={!tema.trim()} style={{ width:"100%", padding:"16px", borderRadius:10, border:"none", cursor:tema.trim()?"pointer":"not-allowed", background:tema.trim()?"var(--green)":"var(--s3)", color:tema.trim()?"#07080f":"var(--t3)", fontSize:17, fontWeight:900, fontFamily:"Cabinet Grotesk", transition:"all .18s", marginBottom:8 }}>🚀 Gerar Prompt</button>
+      <button className="btn btn-primary" onClick={handleGerar} style={{ width: "100%", padding: "14px", fontSize: 15, fontWeight: 700 }}>✨ Gerar Prompt</button>
 
-      {promptGerado&&(
-        <div id="gp-output" style={{ marginTop:24 }}>
-          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:12, flexWrap:"wrap", gap:8 }}>
-            <div style={{ fontSize:13, fontWeight:700, letterSpacing:.6, textTransform:"uppercase", color:"var(--green)" }}>✅ Prompt Gerado</div>
-            <div style={{ display:"flex", gap:8, flexWrap:"wrap" }}>
-              <button onClick={handleCopiar} style={{ padding:"8px 16px", borderRadius:8, border:"1px solid "+(copied?"var(--green)":"var(--b2)"), background:copied?"var(--green-d)":"var(--s2)", color:copied?"var(--green)":"var(--t1)", fontSize:12, fontWeight:600, cursor:"pointer" }}>{copied?"✅ Copiado!":"📋 Copiar"}</button>
-              <button onClick={handleDownload} style={{ padding:"8px 16px", borderRadius:8, border:"1px solid var(--b2)", background:"var(--s2)", color:"var(--t1)", fontSize:12, fontWeight:600, cursor:"pointer" }}>💾 Baixar .txt</button>
-              <button onClick={()=>window.open("https://chat.openai.com","_blank")} style={{ padding:"8px 16px", borderRadius:8, border:"none", background:"#10a37f", color:"#fff", fontSize:12, fontWeight:600, cursor:"pointer" }}>🤖 ChatGPT</button>
-              <button onClick={()=>window.open("https://claude.ai","_blank")} style={{ padding:"8px 16px", borderRadius:8, border:"none", background:"#c9622a", color:"#fff", fontSize:12, fontWeight:600, cursor:"pointer" }}>✴ Claude</button>
+      {promptGerado && (
+        <div id="gp-output" className="card" style={{ marginTop: 24 }}>
+          <div className="row-b" style={{ marginBottom: 12 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: "var(--t1)" }}>📋 Prompt gerado</div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <button className="btn btn-ghost btn-xs" onClick={handleCopiar}>{copied ? "✓ Copiado" : "📋 Copiar"}</button>
+              <button className="btn btn-ghost btn-xs" onClick={handleDownload}>⬇ Baixar .txt</button>
+              <button className="btn btn-ghost btn-xs" onClick={handleAbrirChatGPT}>🤖 Abrir ChatGPT</button>
+              <button className="btn btn-ghost btn-xs" onClick={handleAbrirClaude}>🧡 Abrir Claude</button>
             </div>
           </div>
-          <textarea readOnly value={promptGerado} onClick={e=>e.target.select()} style={{ width:"100%", minHeight:380, padding:"20px", borderRadius:12, boxSizing:"border-box", background:"var(--s1)", border:"1.5px solid var(--green)", color:"var(--t1)", fontSize:13, lineHeight:1.75, fontFamily:"inherit", resize:"vertical", outline:"none", boxShadow:"0 0 0 4px rgba(34,211,165,0.07)" }}/>
-          <div style={{ marginTop:8, fontSize:11, color:"var(--t3)", textAlign:"right" }}>💡 Clique na caixa para selecionar tudo · {promptGerado.length} caracteres</div>
+          <pre style={{ margin: 0, padding: 14, background: "var(--bg)", borderRadius: 8, fontSize: 13, lineHeight: 1.6, color: "var(--t1)", whiteSpace: "pre-wrap", fontFamily: "ui-monospace, monospace", border: "1px solid var(--b1)" }}>{promptGerado}</pre>
+          <div style={{ marginTop: 12, fontSize: 11, color: "var(--t3)" }}>
+            💡 Dica: copie o prompt e cole no ChatGPT, Claude, Gemini ou qualquer IA. Para resultados melhores, use modelos pagos (GPT-4o, Claude Opus/Sonnet 4.x).
+          </div>
         </div>
       )}
     </div>
   );
 }
 
+
 // ============================================================
-// APP ROOT
+// BATALHA: Area do aluno
 // ============================================================
+function AlunoBatalha({ user, refresh }) {
+  const batalhas = batalhasModule.getByAluno(user.id);
+  return (
+    <div>
+      <div className="ph"><div><h1>⚔️ Batalha</h1><p>Compita com seus colegas resolvendo simulados</p></div></div>
+      <div className="card">
+        {batalhas.length === 0 ? (
+          <p className="text-muted text-sm">Nenhuma batalha disponível no momento.</p>
+        ) : (
+          <div>{batalhas.length} batalha(s) disponível(eis). Recurso completo será restaurado em breve.</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [user, setUser] = useState(null);
   const [page, setPage] = useState("dashboard");
@@ -7920,6 +8715,8 @@ export default function App() {
   useEffect(() => {
     storage.load().then(() => {
       setDbLoaded(true);
+      try { planosModule.iniciarRemanejamentoAutomatico(); }
+      catch(e) { console.warn("[EstudaAI] iniciarRemanejamentoAutomatico:", e); }
       try {
         const savedId = localStorage.getItem('estudaai_session');
         if (savedId) {
@@ -7979,9 +8776,9 @@ export default function App() {
     }
     if (user.role === "aluno") {
       if (page === "dashboard") return <AlunoDashboard user={user} refresh={refresh} setPage={setPage}/>;
-      if (page === "plano")     return <AlunoPlano     user={user} refresh={refresh}/>;
       if (page === "rotina")    return <AlunoRotina    user={user} refresh={refresh}/>;
       if (page === "progresso") return <AlunoProgresso user={user}/>;
+      if (page === "resumos")   return <AlunoResumos   user={user} refresh={refresh}/>;
       if (page === "conteudos") return <AlunoConteudos user={user}/>;
       if (page === "simulados") return <AlunoSimulados user={user} refresh={refresh}/>;
       if (page === "ranking")   return <AlunoRanking   user={user}/>;
